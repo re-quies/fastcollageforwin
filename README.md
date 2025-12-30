@@ -60,7 +60,7 @@ Export
 * output exactly matches the canvas size;
 * ready for printing or digital publishing.
 
-Who PhotoCollage Is For
+Who Fast Collage For Win Is For
 * users who need quick and clean collage creation;
 * designers and photographers preparing layouts;
 * people creating photo books, posters, previews, or social media content;
