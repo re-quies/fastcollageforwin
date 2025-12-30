@@ -1,4 +1,7 @@
 Fast Collage For Win allows you to quickly assemble collages from photos, edit each image freely, and work either with a blank canvas or with automatically generated layouts(in the pipeline).
+
+*Read this in other languages: [Russian](README.ru.md)
+
 Two Working Modes
 
 Free Collage
