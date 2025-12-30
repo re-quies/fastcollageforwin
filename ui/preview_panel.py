@@ -23,7 +23,8 @@ class PreviewList(QListWidget):
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
-
+        self.setDragDropMode(QListWidget.DragDrop)
+        self.setDefaultDropAction(Qt.CopyAction)
         self.setSelectionMode(QListWidget.SingleSelection)
 
     def startDrag(self, supportedActions):
@@ -37,6 +38,7 @@ class PreviewList(QListWidget):
 
         mime = QMimeData()
         mime.setImageData(pixmap)
+        mime.setData("application/x-preview-item", b"1")
 
         drag = QDrag(self)
         drag.setMimeData(mime)
@@ -94,10 +96,28 @@ class PreviewPanel(QDockWidget):
     def __init__(self, parent=None):
         super().__init__("Изображения", parent)
 
+        self.setAcceptDrops(True)   # 🔴 ВАЖНО
+
         self.list = PreviewList(self)
         self.setWidget(self.list)
 
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
+        )
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        # передаём drop внутрь списка
+        self.list.dropEvent(event)
+
 
     def add_images_from_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -120,3 +140,15 @@ class PreviewPanel(QDockWidget):
             item.setData(Qt.UserRole, pixmap)
 
             self.list.addItem(item)
+
+    def remove_current_item(self):
+        row = self.list.currentRow()
+        if row >= 0:
+            self.list.takeItem(row)
+
+    def add_pixmap(self, pixmap: QPixmap):
+        item = QListWidgetItem()
+        item.setIcon(QIcon(pixmap))
+        item.setData(Qt.UserRole, pixmap)
+        item.setSizeHint(QSize(96, 96))
+        self.list.addItem(item)

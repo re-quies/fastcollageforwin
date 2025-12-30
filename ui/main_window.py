@@ -23,6 +23,10 @@ from PySide6.QtCore import (
     QMimeData, 
     QPointF
 )    
+from templates.template_generator import TemplateGenerator
+from canvas.template_slot_item import TemplateSlotItem
+from ui.image_count_dialog import ImageCountDialog
+from ui.start_mode_dialog import StartModeDialog
 from ui.preview_panel import PreviewPanel
 from canvas.image_item import ImageItem
 from undo.commands import AddItemCommand
@@ -91,6 +95,10 @@ class GraphicsView(QGraphicsView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Z:
             self.content_zoom_mode = True
+        if event.key() == Qt.Key_X:
+            self._return_selected_item_to_preview()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
@@ -127,7 +135,7 @@ class GraphicsView(QGraphicsView):
         md = event.mimeData()
         view_pos = event.position()
 
-        # 1) Drag из проводника (ОСТАВЛЯЕМ как есть)
+        # 1) Drag из проводника — НЕ ТРОГАЕМ
         if md.hasUrls():
             for url in md.urls():
                 path = url.toLocalFile()
@@ -136,11 +144,16 @@ class GraphicsView(QGraphicsView):
             event.acceptProposedAction()
             return
 
-        # 2) Drag из панели превью (Pixmap)
+        # 2) Drag из панели превью
         if md.hasImage():
             pixmap = md.imageData()
             if isinstance(pixmap, QPixmap) and not pixmap.isNull():
                 self._add_image_from_pixmap(pixmap, view_pos)
+
+                # 🔴 ЕСЛИ drag пришёл из превью — чистим меню
+                if md.hasFormat("application/x-preview-item"):
+                    self.window().preview_panel.remove_current_item()
+
             event.acceptProposedAction()
             return
 
@@ -220,6 +233,36 @@ class GraphicsView(QGraphicsView):
         if hasattr(self.parent(), "update_zoom_label"):
             self.parent().update_zoom_label(percent)
 
+    def _return_selected_item_to_preview(self):
+        scene = self.scene()
+        if not scene:
+            return
+
+        items = scene.selectedItems()
+        if not items:
+            return
+
+        item = items[0]
+
+        # Нас интересуют только ImageItem
+        if not hasattr(item, "original_pixmap"):
+            return
+
+        pixmap = item.original_pixmap
+        if pixmap.isNull():
+            return
+
+        window = self.window()
+        if not hasattr(window, "preview_panel"):
+            return
+
+        # 1️⃣ добавляем в превью
+        window.preview_panel.add_pixmap(pixmap)
+
+        # 2️⃣ удаляем с холста
+        scene.removeItem(item)
+
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -242,6 +285,24 @@ class MainWindow(QMainWindow):
 
         self.preview_panel = PreviewPanel(self)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_panel)
+        dialog = StartModeDialog(self)
+        if not dialog.exec():
+            self.close()
+            return
+
+        self.start_mode = dialog.result_mode
+        self.image_count = None
+
+        if self.start_mode == "random":
+            count_dialog = ImageCountDialog(self)
+            if not count_dialog.exec():
+                self.close()
+                return
+
+            self.image_count = count_dialog.get_count()
+
+        if self.start_mode == "random":
+            self._create_random_template()
 
         self._create_menu()
 
@@ -339,7 +400,7 @@ class MainWindow(QMainWindow):
 
     def open_github(self):
         """Открывает страницу GitHub в браузере."""
-        url = "https://github.com/your-github-repository"  # Замените на ссылку вашего репозитория
+        url = "https://github.com/re-quies/fastcollageforwin"  # Замените на ссылку вашего репозитория
         webbrowser.open(url)
 
     def _selected_item(self):
@@ -463,3 +524,18 @@ class MainWindow(QMainWindow):
 
         if ok:
             self.view.set_zoom_percent(value)
+
+    def _create_random_template(self):
+        generator = TemplateGenerator(
+            self.scene.canvas_width,
+            self.scene.canvas_height
+        )
+
+        rects = generator.generate(self.image_count)
+
+        self.template_slots = []
+
+        for rect in rects:
+            slot = TemplateSlotItem(rect)
+            self.scene.addItem(slot)
+            self.template_slots.append(slot)
