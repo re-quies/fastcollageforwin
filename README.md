@@ -1,4 +1,4 @@
-Fast Collage For Win allows you to quickly assemble collages from photos, edit each image freely, and work either with a blank canvas or with automatically generated layouts(in the pipeline).
+Fast Collage For Win allows you to quickly assemble collages from photos, edit each image freely, and work either with a blank canvas or with automatically generated layouts.
 
 *Read this in other languages: [Russian](README.ru.md)
 
@@ -12,7 +12,7 @@ Ideal if you want complete creative freedom:
 * free movement, scaling, and rotation of images;
 * perfect for creative and non-standard compositions.
 
-Random Collage(in the pipeline)
+Random Collage
    
 Ideal for fast and structured results:
 * you choose the number of images;
@@ -21,7 +21,7 @@ Ideal for fast and structured results:
 * each image is placed into its own frame (slot);
 * images can be swapped, scaled, rotated, and mirrored inside their frames.
 
-<img width="2485" height="1438" alt="test1" src="https://github.com/user-attachments/assets/3745ac2b-32c7-49b8-b94d-d2b822e7df5c" />
+<img width="2482" height="1434" alt="test" src="https://github.com/user-attachments/assets/2656a52d-a0a3-4490-8f14-9b501a547a2c" />
 
 Image Editing
 
