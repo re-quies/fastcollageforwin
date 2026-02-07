@@ -5,13 +5,14 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QComboBox,
 )
+import i18n
 
 
 class CanvasSizeDialog(QDialog):
     def __init__(self, width, height, parent=None):
         super().__init__(parent)
 
-        self.setWindowTitle("Размер холста")
+        self.setWindowTitle(i18n.t('canvas_size'))
         self.presets = {
             "1080 x 720px": (1080, 720),
             "1920 × 1080px": (1920, 1080),
@@ -36,9 +37,9 @@ class CanvasSizeDialog(QDialog):
         self.height_spin.setValue(height)
 
         layout = QFormLayout(self)
-        layout.addRow("Пресет:", self.preset_combo)
-        layout.addRow("Ширина (px):", self.width_spin)
-        layout.addRow("Высота (px):", self.height_spin)
+        layout.addRow(i18n.t('canvas_size_label'), self.preset_combo)
+        layout.addRow(i18n.t('width_px'), self.width_spin)
+        layout.addRow(i18n.t('height_px'), self.height_spin)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel

@@ -1,4 +1,5 @@
 from PySide6.QtGui import QUndoCommand
+import i18n
 
 
 class AddItemCommand(QUndoCommand):
@@ -7,7 +8,7 @@ class AddItemCommand(QUndoCommand):
     """
 
     def __init__(self, scene, item):
-        super().__init__("Добавить изображение")
+        super().__init__(i18n.t('undo_add'))
         self.scene = scene
         self.item = item
 
@@ -34,7 +35,7 @@ class TransformCommand(QUndoCommand):
         new_scale,
         new_rotation,
     ):
-        super().__init__("Трансформация")
+        super().__init__(i18n.t('undo_transform'))
 
         self.item = item
 

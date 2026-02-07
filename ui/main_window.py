@@ -23,15 +23,15 @@ from PySide6.QtCore import (
     QMimeData, 
     QPointF
 )    
-from templates.template_generator import TemplateGenerator
-from canvas.template_slot_item import TemplateSlotItem
-from ui.image_count_dialog import ImageCountDialog
-from ui.start_mode_dialog import StartModeDialog
 from ui.preview_panel import PreviewPanel
 from canvas.image_item import ImageItem
 from undo.commands import AddItemCommand
 from canvas.scene import CanvasScene
 from ui.canvas_size_dialog import CanvasSizeDialog
+from core.collage_mode import CollageMode
+from ui.start_dialog import StartCollageDialog
+import i18n
+from PySide6.QtWidgets import QPushButton
 
 class GraphicsView(QGraphicsView):
     def wheelEvent(self, event):
@@ -92,17 +92,37 @@ class GraphicsView(QGraphicsView):
         super().wheelEvent(event)
 
 
+  #  def keyPressEvent(self, event):
+  #      if event.key() == Qt.Key_Z:
+   #         self.content_zoom_mode = True
+    #    super().keyPressEvent(event)
+
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Z:
+        # Поддержка русской и английской раскладки: проверяем и Qt.Key, и текст символа
+        def _is_key(ev, qt_key, *chars):
+            try:
+                txt = ev.text().lower()
+            except Exception:
+                txt = ""
+            return ev.key() == qt_key or (txt in chars)
+
+        if _is_key(event, Qt.Key_Z, 'z', 'я'):
             self.content_zoom_mode = True
-        if event.key() == Qt.Key_X:
+        if _is_key(event, Qt.Key_X, 'x', 'ч'):
             self._return_selected_item_to_preview()
             event.accept()
             return
         super().keyPressEvent(event)
-
+    
     def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key_Z:
+        def _is_key(ev, qt_key, *chars):
+            try:
+                txt = ev.text().lower()
+            except Exception:
+                txt = ""
+            return ev.key() == qt_key or (txt in chars)
+
+        if _is_key(event, Qt.Key_Z, 'z', 'я'):
             self.content_zoom_mode = False
         super().keyReleaseEvent(event)
 
@@ -137,6 +157,17 @@ class GraphicsView(QGraphicsView):
 
         # 1) Drag из проводника — НЕ ТРОГАЕМ
         if md.hasUrls():
+            # В template режиме — запрещаем добавление вне слота
+            scene_pos = self.mapToScene(view_pos.toPoint())
+            scene = self.scene()
+            if getattr(scene, "is_template_mode", False):
+                items = scene.items(scene_pos)
+                from canvas.slot_item import TemplateSlotItem
+                has_slot = any(isinstance(it, TemplateSlotItem) for it in items)
+                if not has_slot:
+                    event.ignore()
+                    return
+
             for url in md.urls():
                 path = url.toLocalFile()
                 if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
@@ -148,6 +179,21 @@ class GraphicsView(QGraphicsView):
         if md.hasImage():
             pixmap = md.imageData()
             if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+                # В template режиме — запрещаем добавление вне слота
+                scene_pos = self.mapToScene(view_pos.toPoint())
+                scene = self.scene()
+                if getattr(scene, "is_template_mode", False):
+                    items = scene.items(scene_pos)
+                    from canvas.slot_item import TemplateSlotItem
+                    slot = None
+                    for it in items:
+                        if isinstance(it, TemplateSlotItem):
+                            slot = it
+                            break
+                    if slot is None:
+                        event.ignore()
+                        return
+
                 self._add_image_from_pixmap(pixmap, view_pos)
 
                 # 🔴 ЕСЛИ drag пришёл из превью — чистим меню
@@ -168,9 +214,36 @@ class GraphicsView(QGraphicsView):
 
     def _add_image_from_pixmap(self, pixmap: QPixmap, view_pos):
         from canvas.image_item import ImageItem
+        from canvas.slot_item import TemplateSlotItem
 
         scene_pos = self.mapToScene(view_pos.toPoint())
 
+        # Если мы в template mode — попытаемся положить изображение в слот
+        scene = self.scene()
+        if getattr(scene, "is_template_mode", False):
+            # Ищем слот под курсором
+            items = scene.items(scene_pos)
+            slot = None
+            for it in items:
+                if isinstance(it, TemplateSlotItem):
+                    slot = it
+                    break
+
+            if slot is not None:
+                item = ImageItem(pixmap)
+                # Добавляем на сцену и делегируем слоту управление позиционированием
+                scene.addItem(item)
+                try:
+                    delay = getattr(self.scene, 'swap_delay_ms', None)
+                    if delay is not None and hasattr(item, '_hover_timer'):
+                        item._hover_timer.setInterval(delay)
+                except Exception:
+                    pass
+                slot.accept_image(item)
+                item.setSelected(True)
+                return
+
+        # Обычное поведение — свободный ImageItem
         item = ImageItem(pixmap)
         item.setPos(
             scene_pos
@@ -178,6 +251,13 @@ class GraphicsView(QGraphicsView):
         )
 
         self.scene().addItem(item)
+        try:
+            delay = getattr(self.scene, 'swap_delay_ms', None)
+            if delay is not None and hasattr(item, '_hover_timer'):
+                item._hover_timer.setInterval(delay)
+        except Exception:
+            pass
+
         item.setSelected(True)
 
 
@@ -263,17 +343,25 @@ class GraphicsView(QGraphicsView):
         scene.removeItem(item)
 
 
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("PhotoCollage (Windows)")
+        self.swap_delay_ms = 1000
+
+        self.setWindowTitle(i18n.t('app_title'))
         self.resize(1200, 800)
+        # Открывать приложение в развернутом (максимизированном) окне
+        try:
+            self.showMaximized()
+        except Exception:
+            # fallback: установить состояние окна как максимизированное
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         self.undo_stack = QUndoStack(self)
 
         self.scene = CanvasScene()
+        self.scene.swap_delay_ms = self.swap_delay_ms
         self.view = GraphicsView(self.scene)
 
         self.setCentralWidget(self.view)
@@ -283,106 +371,101 @@ class MainWindow(QMainWindow):
         self.zoom_label = QLabel("100%")
         self.statusBar().addPermanentWidget(self.zoom_label)
 
+        # Добавляем кнопки масштаба справа снизу
+        self.zoom_minus = QPushButton("-", self)
+        self.zoom_minus.setFixedSize(24, 24)
+        self.zoom_minus.clicked.connect(lambda: self.view.zoom_out())
+        self.statusBar().addPermanentWidget(self.zoom_minus)
+
+        self.zoom_plus = QPushButton("+", self)
+        self.zoom_plus.setFixedSize(24, 24)
+        self.zoom_plus.clicked.connect(lambda: self.view.zoom_in())
+        self.statusBar().addPermanentWidget(self.zoom_plus)
+
         self.preview_panel = PreviewPanel(self)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_panel)
-        dialog = StartModeDialog(self)
-        if not dialog.exec():
-            self.close()
-            return
-
-        self.start_mode = dialog.result_mode
-        self.image_count = None
-
-        if self.start_mode == "random":
-            count_dialog = ImageCountDialog(self)
-            if not count_dialog.exec():
-                self.close()
-                return
-
-            self.image_count = count_dialog.get_count()
-
-        if self.start_mode == "random":
-            self._create_random_template()
-
+        self.collage_mode = CollageMode.FREE
         self._create_menu()
 
 
 
     # ---------- Menu ----------
     def _create_menu(self):
-        file_menu = self.menuBar().addMenu("Файл")
+        self.menuBar().clear()
+        file_menu = self.menuBar().addMenu(i18n.t('file'))
+        new_action = QAction(i18n.t('new_collage'), self)
+        new_action.triggered.connect(self.create_new_collage)
+        file_menu.addAction(new_action)
 
-        add_image_action = QAction("Добавить изображение", self)
+        add_image_action = QAction(i18n.t('add_image'), self)
         add_image_action.setShortcut("Ctrl+O")
         add_image_action.triggered.connect(self.add_image)
         file_menu.addAction(add_image_action)
-        add_to_panel_action = QAction("Загрузить в панель", self)
+        add_to_panel_action = QAction(i18n.t('load_to_panel'), self)
         add_to_panel_action.triggered.connect(
             self.preview_panel.add_images_from_files
         )
         file_menu.addAction(add_to_panel_action)
 
-        export_action = QAction("Экспорт", self)
+        export_action = QAction(i18n.t('export'), self)
         export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self.export_image)
         file_menu.addAction(export_action)
 
-        edit_menu = self.menuBar().addMenu("Правка")
+        edit_menu = self.menuBar().addMenu(i18n.t('edit'))
 
-        undo_action = self.undo_stack.createUndoAction(self, "Отменить")
+        undo_action = self.undo_stack.createUndoAction(self, i18n.t('undo'))
         undo_action.setShortcut("Ctrl+Z")
         edit_menu.addAction(undo_action)
-
-        redo_action = self.undo_stack.createRedoAction(self, "Повторить")
+        redo_action = self.undo_stack.createRedoAction(self, i18n.t('redo'))
         redo_action.setShortcut("Ctrl+Y")
         edit_menu.addAction(redo_action)
 
-        delete_action = QAction("Удалить", self)
+        delete_action = QAction(i18n.t('delete'), self)
         delete_action.setShortcut("Delete")
         delete_action.triggered.connect(self.delete_selected)
         edit_menu.addAction(delete_action)
 
-        layer_menu = self.menuBar().addMenu("Слои")
+        layer_menu = self.menuBar().addMenu(i18n.t('layers'))
 
-        bring_front = QAction("На передний план", self)
+        bring_front = QAction(i18n.t('bring_front'), self)
         bring_front.setShortcut("Ctrl+]")
         bring_front.triggered.connect(self.bring_to_front)
-
-        send_back = QAction("На задний план", self)
+        send_back = QAction(i18n.t('send_back'), self)
         send_back.setShortcut("Ctrl+[")
         send_back.triggered.connect(self.send_to_back)
 
         layer_menu.addAction(bring_front)
         layer_menu.addAction(send_back)
 
-        canvas_menu = self.menuBar().addMenu("Холст")
+        canvas_menu = self.menuBar().addMenu(i18n.t('canvas'))
 
-        resize_action = QAction("Размер холста...", self)
+        resize_action = QAction(i18n.t('canvas_size'), self)
         resize_action.setShortcut("Ctrl+Shift+C")
         resize_action.triggered.connect(self.change_canvas_size)
         canvas_menu.addAction(resize_action)
 
         # Добавляем новые действия для зеркалирования
-        mirror_menu = self.menuBar().addMenu("Изображение")
+        mirror_menu = self.menuBar().addMenu(i18n.t('image_menu'))
         
-        horizontal_mirror_action = QAction("Зеркалить по горизонтали", self)
+        horizontal_mirror_action = QAction(i18n.t('mirror_h'), self)
         horizontal_mirror_action.setShortcut("Ctrl+Shift+H")
         horizontal_mirror_action.triggered.connect(self.horizontal_mirror)
         mirror_menu.addAction(horizontal_mirror_action)
 
-        vertical_mirror_action = QAction("Зеркалить по вертикали", self)
+        vertical_mirror_action = QAction(i18n.t('mirror_v'), self)
         vertical_mirror_action.setShortcut("Ctrl+Shift+V")
         vertical_mirror_action.triggered.connect(self.vertical_mirror)
         mirror_menu.addAction(vertical_mirror_action)
 
-        developer_menu = self.menuBar().addMenu("Разработчик")
-        developer_action = QAction("Перейти на GitHub", self)
+        developer_menu = self.menuBar().addMenu(i18n.t('developer'))
+        developer_action = QAction(i18n.t('open_github'), self)
         developer_action.triggered.connect(self.open_github)
         developer_menu.addAction(developer_action)
 
-        view_menu = self.menuBar().addMenu("Вид")
+        view_menu = self.menuBar().addMenu(i18n.t('view'))
 
-        toggle_preview = QAction("Панель изображений", self)
+        toggle_preview = QAction(i18n.t('toggle_preview'), self)
         toggle_preview.setCheckable(True)
         toggle_preview.setChecked(True)
         toggle_preview.triggered.connect(
@@ -391,10 +474,25 @@ class MainWindow(QMainWindow):
 
         view_menu.addAction(toggle_preview)
 
-        zoom_action = QAction("Масштаб...", self)
+        zoom_action = QAction(i18n.t('zoom'), self)
         zoom_action.setShortcut("Ctrl+M")
         zoom_action.triggered.connect(self.set_exact_zoom)
         view_menu.addAction(zoom_action)
+
+        # --- Settings menu ---
+        settings_menu = self.menuBar().addMenu(i18n.t('settings'))
+        swap_delay_action = QAction(i18n.t('swap_delay'), self)
+        swap_delay_action.triggered.connect(self.change_swap_delay)
+        settings_menu.addAction(swap_delay_action)
+
+        # Language submenu
+        language_menu = settings_menu.addMenu(i18n.t('language'))
+        ru_action = QAction(i18n.t('russian'), self)
+        ru_action.triggered.connect(lambda: self.set_language('ru'))
+        en_action = QAction(i18n.t('english'), self)
+        en_action.triggered.connect(lambda: self.set_language('en'))
+        language_menu.addAction(ru_action)
+        language_menu.addAction(en_action)
 
     # ---------- Helpers ----------
 
@@ -426,6 +524,14 @@ class MainWindow(QMainWindow):
         item = ImageItem(pixmap)
         item.setPos(0, 0)
         item.setSelected(True)
+
+        # Устанавливаем задержку swap для нового элемента
+        try:
+            delay = getattr(self.scene, 'swap_delay_ms', None)
+            if delay is not None and hasattr(item, '_hover_timer'):
+                item._hover_timer.setInterval(delay)
+        except Exception:
+            pass
 
         cmd = AddItemCommand(self.scene, item)
         self.undo_stack.push(cmd)
@@ -508,14 +614,59 @@ class MainWindow(QMainWindow):
         for item in self.scene.selectedItems():
             self.scene.removeItem(item)
 
+    def change_swap_delay(self):
+        value, ok = QInputDialog.getInt(
+            self,
+            i18n.t('swap_delay'),
+            i18n.t('swap_delay'),
+            self.swap_delay_ms,
+            100,
+            5000,
+            100,
+        )
+
+        if ok:
+            self.swap_delay_ms = value
+            if hasattr(self.scene, 'swap_delay_ms'):
+                self.scene.swap_delay_ms = value
+
+            # Обновляем существующие ImageItem'ы
+            for it in self.scene.items():
+                try:
+                    if hasattr(it, '_hover_timer'):
+                        it._hover_timer.setInterval(value)
+                except Exception:
+                    pass
+
+    def set_language(self, lang: str):
+        import i18n as _i18n
+        _i18n.set_lang(lang)
+        # Пересобираем меню и обновляем тексты
+        self.setWindowTitle(_i18n.t('app_title'))
+        self._create_menu()
+        # Обновляем заголовок панели превью
+        try:
+            self.preview_panel.setWindowTitle(_i18n.t('images'))
+        except Exception:
+            pass
+
     def update_zoom_label(self, percent):
-        self.zoom_label.setText(f"{percent}%")
+        # percent может быть float (масштаб 1.0) или int (проценты)
+        try:
+            if isinstance(percent, float):
+                value = int(round(percent * 100))
+            else:
+                value = int(round(percent))
+        except Exception:
+            value = percent
+
+        self.zoom_label.setText(f"{value}%")
 
     def set_exact_zoom(self):
         value, ok = QInputDialog.getInt(
             self,
-            "Масштаб холста",
-            "Укажите масштаб (%)",
+            i18n.t('zoom'),
+            i18n.t('enter_zoom'),
             self.view.zoom_percent,
             10,
             800,
@@ -525,17 +676,48 @@ class MainWindow(QMainWindow):
         if ok:
             self.view.set_zoom_percent(value)
 
-    def _create_random_template(self):
-        generator = TemplateGenerator(
-            self.scene.canvas_width,
-            self.scene.canvas_height
-        )
+    def create_new_collage(self):
+        dialog = StartCollageDialog(self)
+        if not dialog.exec():
+            return
 
-        rects = generator.generate(self.image_count)
+        data = dialog.result_data()
+        self.collage_mode = data["mode"]
 
-        self.template_slots = []
+        # --- TEMPLATE MODE ---
+        if self.collage_mode == CollageMode.TEMPLATE:
+            w, h = data["canvas_size"]
 
-        for rect in rects:
-            slot = TemplateSlotItem(rect)
-            self.scene.addItem(slot)
-            self.template_slots.append(slot)
+            self.scene = CanvasScene(w, h)
+            self.scene.swap_delay_ms = self.swap_delay_ms
+            self.scene.is_template_mode = True
+            self.scene.template_image_count = data["count"]
+            self.scene.build_template()
+
+        # --- FREE MODE ---
+        else:
+            # В свободном режиме также используем выбранный размер холста
+            w, h = data.get("canvas_size", (1920, 1080))
+            self.scene = CanvasScene(w, h)
+            self.scene.swap_delay_ms = self.swap_delay_ms
+
+        # ВАЖНО: setScene ОДИН раз
+        self.view.setScene(self.scene)
+
+    def create_new_collage_from_data(self, data):
+        self.collage_mode = data["mode"]
+
+        if self.collage_mode == CollageMode.TEMPLATE:
+            w, h = data["canvas_size"]
+            self.scene = CanvasScene(w, h)
+            self.scene.swap_delay_ms = self.swap_delay_ms
+            self.scene.is_template_mode = True
+            self.scene.template_image_count = data["count"]
+            self.scene.build_template()
+        else:
+            # В свободном режиме используем выбранный размер холста
+            w, h = data.get("canvas_size", (1920, 1080))
+            self.scene = CanvasScene(w, h)
+            self.scene.swap_delay_ms = self.swap_delay_ms
+
+        self.view.setScene(self.scene)
