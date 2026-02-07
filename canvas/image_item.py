@@ -84,7 +84,14 @@ class ImageItem(QGraphicsPixmapItem):
     def paint(self, painter, option, widget=None):
         super().paint(painter, option, widget)
 
-        if self.isSelected():
+        # Рисуем рамку выделения только если сцена не просит скрыть визуалы
+        try:
+            scene = self.scene()
+            suppress = bool(getattr(scene, 'suppress_visuals', False))
+        except Exception:
+            suppress = False
+
+        if self.isSelected() and not suppress:
             pen = QPen(Qt.blue, 2, Qt.DashLine)
             painter.setPen(pen)
             painter.drawRect(self.boundingRect())

@@ -41,6 +41,12 @@ translations = {
         "image_count": "Количество изображений:",
         "canvas_size_label": "Размер холста:",
         "enter_zoom": "Укажите масштаб (%)",
+        "new_grid": "Новая сетка",
+        "new_grid_tooltip": "Сгенерировать новую случайную сетку (только в шаблонном режиме)",
+        "confirm_regen_title": "Подтвердите действие",
+        "confirm_regen_text": "Старые слоты будут удалены и вложенные изображения вернутся в превью. Продолжить?",
+        "confirm": "Да",
+        "cancel": "Отмена",
     },
     "en": {
         "app_title": "FastCollageForWin",
@@ -84,6 +90,12 @@ translations = {
         "image_count": "Image count:",
         "canvas_size_label": "Canvas size:",
         "enter_zoom": "Enter zoom (%)",
+        "new_grid": "New grid",
+        "new_grid_tooltip": "Generate a new random grid (template mode only)",
+        "confirm_regen_title": "Confirm action",
+        "confirm_regen_text": "Existing slots will be removed and contained images will be returned to the preview. Continue?",
+        "confirm": "Yes",
+        "cancel": "Cancel",
     },
 }
 

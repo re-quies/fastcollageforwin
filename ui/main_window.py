@@ -7,11 +7,14 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QLabel,
     QInputDialog,
+    QMessageBox,
+    QToolButton,
 )
 from PySide6.QtGui import (
     QPixmap,
     QImage,
     QPainter,
+    QIcon,
     QAction,
     QUndoStack,
     QDragEnterEvent, 
@@ -23,6 +26,7 @@ from PySide6.QtCore import (
     QMimeData, 
     QPointF
 )    
+from PySide6.QtCore import QSize
 from ui.preview_panel import PreviewPanel
 from canvas.image_item import ImageItem
 from undo.commands import AddItemCommand
@@ -382,6 +386,26 @@ class MainWindow(QMainWindow):
         self.zoom_plus.clicked.connect(lambda: self.view.zoom_in())
         self.statusBar().addPermanentWidget(self.zoom_plus)
 
+        # Кнопка для регенерации случайной сетки в TEMPLATE режиме (иконка только)
+        self.regen_grid_btn = QToolButton(self)
+        try:
+            icon = QIcon('assets/icons/new_grid.svg')
+            if not icon.isNull():
+                self.regen_grid_btn.setIcon(icon)
+                self.regen_grid_btn.setIconSize(QSize(18, 18))
+        except Exception:
+            pass
+
+        self.regen_grid_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.regen_grid_btn.clicked.connect(self.regenerate_template_grid)
+        # Локализованная подсказка
+        try:
+            self.regen_grid_btn.setToolTip(i18n.t('new_grid_tooltip'))
+        except Exception:
+            pass
+
+        self.statusBar().addPermanentWidget(self.regen_grid_btn)
+
         self.preview_panel = PreviewPanel(self)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_panel)
         self.collage_mode = CollageMode.FREE
@@ -571,9 +595,45 @@ class MainWindow(QMainWindow):
         )
         image.fill(Qt.white)
 
+        # Скрыть все визуальные маркеры/выделения на сцене во время рендеринга
+        prev_suppress = getattr(self.scene, 'suppress_visuals', False)
+        self.scene.suppress_visuals = True
+
+        # Удаляем визуальные индикаторы hover у ImageItem'ов (например "Release to drop")
+        try:
+            for it in list(self.scene.items()):
+                try:
+                    if hasattr(it, '_clear_hover_indicator'):
+                        it._clear_hover_indicator()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Сохраняем предыдущее состояние подсветки слотов, затем отключаем их
+        prev_highlights = []
+        try:
+            for slot in getattr(self.scene, 'template_slots', []):
+                prev_highlights.append(bool(getattr(slot, '_highlighted', False)))
+                slot.set_highlight(False)
+                slot._update_handles()
+        except Exception:
+            prev_highlights = []
+
+        self.scene.update()
+
         painter = QPainter(image)
         self.scene.render(painter)
         painter.end()
+
+        # Восстановим состояние визуализации
+        try:
+            for slot, prev in zip(getattr(self.scene, 'template_slots', []), prev_highlights):
+                slot.set_highlight(prev)
+                slot._update_handles()
+        except Exception:
+            pass
+        self.scene.suppress_visuals = prev_suppress
 
         image.save(file_path)
 
@@ -721,3 +781,61 @@ class MainWindow(QMainWindow):
             self.scene.swap_delay_ms = self.swap_delay_ms
 
         self.view.setScene(self.scene)
+
+    def regenerate_template_grid(self):
+        """Обработчик кнопки: регенерация сетки только в TEMPLATE режиме."""
+        # Если текущее состояние не шаблон — ничего не делаем
+        if self.collage_mode != CollageMode.TEMPLATE:
+            return
+
+        # Если сцена не в шаблонном режиме — ничего не делаем
+        scene = self.get_active_scene()
+        if not getattr(scene, 'is_template_mode', False):
+            return
+
+        # Если нет ни одного изображения на холсте и ни в слотах — подтверждение не требуем
+        try:
+            images_present = False
+
+            # 1) Ищем ImageItem по наличию атрибута original_pixmap
+            try:
+                for it in scene.items():
+                    if hasattr(it, 'original_pixmap'):
+                        images_present = True
+                        break
+            except Exception:
+                images_present = False
+
+            # 2) Также проверяем, есть ли в слотах связанные изображения
+            try:
+                if not images_present:
+                    for slot in getattr(scene, 'template_slots', []):
+                        if getattr(slot, 'image_item', None) is not None:
+                            images_present = True
+                            break
+            except Exception:
+                pass
+        except Exception:
+            images_present = True
+
+        # Если есть изображения — попросим подтверждение перед удалением
+        if images_present:
+            try:
+                msg = QMessageBox(self)
+                msg.setWindowTitle(i18n.t('confirm_regen_title'))
+                msg.setText(i18n.t('confirm_regen_text'))
+                msg.setIcon(QMessageBox.Warning)
+                yes = msg.addButton(i18n.t('confirm'), QMessageBox.AcceptRole)
+                no = msg.addButton(i18n.t('cancel'), QMessageBox.RejectRole)
+                msg.exec()
+                if msg.clickedButton() is not yes:
+                    return
+            except Exception:
+                # Если диалог не доступен — продолжаем
+                pass
+
+        # Перестроим шаблон (CanvasScene.build_template отвечает за очистку старых слотов)
+        try:
+            scene.build_template()
+        except Exception:
+            pass
