@@ -1,4 +1,4 @@
-Fast Collage For Win allows you to quickly assemble collages from photos, edit each image freely, and work either with a blank canvas or with automatically generated layouts.
+Fast Collage For Win is a small Python application for quickly creating collages.
 
 *Read this in other languages: [Russian](README.ru.md)
 
@@ -21,7 +21,7 @@ Ideal for fast and structured results:
 * each image is placed into its own frame (slot);
 * images can be swapped, scaled, rotated, and mirrored inside their frames.
 
-<img width="2482" height="1434" alt="test" src="https://github.com/user-attachments/assets/2656a52d-a0a3-4490-8f14-9b501a547a2c" />
+<img width="2485" height="1439" alt="test" src="https://github.com/user-attachments/assets/2d1062fd-11d9-440e-8e38-3b4127bf624f" />
 
 Image Editing
 
