@@ -1,14 +1,17 @@
+import json
+import logging
+import os
 import webbrowser
+
 from PySide6.QtWidgets import (
     QMainWindow,
-    QGraphicsScene,
     QFileDialog,
     QGraphicsView,
-    QMenuBar,
     QLabel,
     QInputDialog,
     QMessageBox,
     QToolButton,
+    QPushButton,
 )
 from PySide6.QtGui import (
     QPixmap,
@@ -17,25 +20,28 @@ from PySide6.QtGui import (
     QIcon,
     QAction,
     QUndoStack,
-    QDragEnterEvent, 
+    QDragEnterEvent,
     QDropEvent,
-    QKeySequence,
 )
-from PySide6.QtCore import (
-    Qt,
-    QMimeData, 
-    QPointF
-)    
-from PySide6.QtCore import QSize
+from PySide6.QtCore import Qt, QPointF, QSize
+
 from ui.preview_panel import PreviewPanel
 from canvas.image_item import ImageItem
-from undo.commands import AddItemCommand
+from canvas.slot_item import TemplateSlotItem
+from undo.commands import (
+    AddItemCommand,
+    DeleteItemsCommand,
+    ReturnToPreviewCommand,
+)
 from canvas.scene import CanvasScene
 from ui.canvas_size_dialog import CanvasSizeDialog
 from core.collage_mode import CollageMode
+from core import project_io
 from ui.start_dialog import StartCollageDialog
 import i18n
-from PySide6.QtWidgets import QPushButton
+
+logger = logging.getLogger(__name__)
+
 
 class GraphicsView(QGraphicsView):
     def wheelEvent(self, event):
@@ -49,7 +55,11 @@ class GraphicsView(QGraphicsView):
             return
 
         factor = 1.1 if delta > 0 else 0.9
-        selected = scene.selectedItems()
+        # Колесом вращаем/масштабируем только изображения —
+        # выделенный СЛОТ не должен деформироваться этими жестами
+        selected = [
+            it for it in scene.selectedItems() if isinstance(it, ImageItem)
+        ]
 
         # =========================
         # SHIFT + WHEEL → ROTATE ITEM
@@ -95,39 +105,31 @@ class GraphicsView(QGraphicsView):
         # =========================
         super().wheelEvent(event)
 
-
-  #  def keyPressEvent(self, event):
-  #      if event.key() == Qt.Key_Z:
-   #         self.content_zoom_mode = True
-    #    super().keyPressEvent(event)
-
     def keyPressEvent(self, event):
         # Поддержка русской и английской раскладки: проверяем и Qt.Key, и текст символа
         def _is_key(ev, qt_key, *chars):
-            try:
-                txt = ev.text().lower()
-            except Exception:
-                txt = ""
+            txt = ev.text().lower()
             return ev.key() == qt_key or (txt in chars)
 
         if _is_key(event, Qt.Key_Z, 'z', 'я'):
             self.content_zoom_mode = True
+        if _is_key(event, Qt.Key_C, 'c', 'с'):
+            self.slot_pan_mode = True
         if _is_key(event, Qt.Key_X, 'x', 'ч'):
             self._return_selected_item_to_preview()
             event.accept()
             return
         super().keyPressEvent(event)
-    
+
     def keyReleaseEvent(self, event):
         def _is_key(ev, qt_key, *chars):
-            try:
-                txt = ev.text().lower()
-            except Exception:
-                txt = ""
+            txt = ev.text().lower()
             return ev.key() == qt_key or (txt in chars)
 
         if _is_key(event, Qt.Key_Z, 'z', 'я'):
             self.content_zoom_mode = False
+        if _is_key(event, Qt.Key_C, 'c', 'с'):
+            self.slot_pan_mode = False
         super().keyReleaseEvent(event)
 
     def __init__(self, scene, parent=None):
@@ -143,11 +145,17 @@ class GraphicsView(QGraphicsView):
         )
         self.setAcceptDrops(True)
         self.content_zoom_mode = False
+        # Режим панорамирования изображения внутри слота (зажата клавиша C)
+        self.slot_pan_mode = False
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         md = event.mimeData()
 
-        if md.hasUrls() or md.hasImage():
+        if (
+            md.hasUrls()
+            or md.hasImage()
+            or md.hasFormat("application/x-preview-path")
+        ):
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -155,22 +163,29 @@ class GraphicsView(QGraphicsView):
     def dragMoveEvent(self, event):
         event.acceptProposedAction()
 
+    def _template_drop_allowed(self, view_pos) -> bool:
+        """В template режиме бросать можно только в слот."""
+        from canvas.slot_item import TemplateSlotItem
+
+        scene = self.scene()
+        if not getattr(scene, "is_template_mode", False):
+            return True
+
+        scene_pos = self.mapToScene(view_pos.toPoint())
+        return any(
+            isinstance(it, TemplateSlotItem)
+            for it in scene.items(scene_pos)
+        )
+
     def dropEvent(self, event: QDropEvent):
         md = event.mimeData()
         view_pos = event.position()
 
-        # 1) Drag из проводника — НЕ ТРОГАЕМ
+        # 1) Drag из проводника
         if md.hasUrls():
-            # В template режиме — запрещаем добавление вне слота
-            scene_pos = self.mapToScene(view_pos.toPoint())
-            scene = self.scene()
-            if getattr(scene, "is_template_mode", False):
-                items = scene.items(scene_pos)
-                from canvas.slot_item import TemplateSlotItem
-                has_slot = any(isinstance(it, TemplateSlotItem) for it in items)
-                if not has_slot:
-                    event.ignore()
-                    return
+            if not self._template_drop_allowed(view_pos):
+                event.ignore()
+                return
 
             for url in md.urls():
                 path = url.toLocalFile()
@@ -179,143 +194,152 @@ class GraphicsView(QGraphicsView):
             event.acceptProposedAction()
             return
 
-        # 2) Drag из панели превью
+        # 2) Drag из панели превью: передаётся ПУТЬ к файлу —
+        # полноразмерное изображение загружается только здесь
+        # (экономия памяти: превью не хранит полноразмерные картинки)
+        if md.hasFormat("application/x-preview-path"):
+            if not self._template_drop_allowed(view_pos):
+                event.ignore()
+                return
+
+            path = bytes(md.data("application/x-preview-path")).decode("utf-8")
+            if self._add_image_from_path(path, view_pos):
+                # ФИКС: удаляем из превью именно перетащенный элемент
+                # (по пути из MIME-данных), а не "текущий выделенный" —
+                # раньше при смене выделения во время drag или при
+                # дубликатах мог удалиться чужой элемент панели.
+                self.window().preview_panel.remove_image(path=path)
+
+            event.acceptProposedAction()
+            return
+
+        # 3) Fallback: превью-элемент без пути к файлу
         if md.hasImage():
             pixmap = md.imageData()
             if isinstance(pixmap, QPixmap) and not pixmap.isNull():
-                # В template режиме — запрещаем добавление вне слота
-                scene_pos = self.mapToScene(view_pos.toPoint())
-                scene = self.scene()
-                if getattr(scene, "is_template_mode", False):
-                    items = scene.items(scene_pos)
-                    from canvas.slot_item import TemplateSlotItem
-                    slot = None
-                    for it in items:
-                        if isinstance(it, TemplateSlotItem):
-                            slot = it
-                            break
-                    if slot is None:
-                        event.ignore()
-                        return
+                if not self._template_drop_allowed(view_pos):
+                    event.ignore()
+                    return
 
                 self._add_image_from_pixmap(pixmap, view_pos)
 
-                # 🔴 ЕСЛИ drag пришёл из превью — чистим меню
+                # ЕСЛИ drag пришёл из превью — чистим панель.
+                # ФИКС: ищем именно перетащенный fallback-элемент
+                # (по cacheKey пиксмапа), а не текущее выделение
                 if md.hasFormat("application/x-preview-item"):
-                    self.window().preview_panel.remove_current_item()
+                    self.window().preview_panel.remove_image(pixmap=pixmap)
 
             event.acceptProposedAction()
             return
 
         event.ignore()
 
-    def _add_image_from_path(self, path: str, view_pos):
-            pixmap = QPixmap(path)
-            if pixmap.isNull():
-                return
+    def _add_image_from_path(self, path: str, view_pos) -> bool:
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            logger.warning("Failed to load image from %s", path)
+            return False
 
-            self._add_image_from_pixmap(pixmap, view_pos)
+        self._add_image_from_pixmap(pixmap, view_pos, source_path=path)
+        return True
 
-    def _add_image_from_pixmap(self, pixmap: QPixmap, view_pos):
+    def _add_image_from_pixmap(self, pixmap: QPixmap, view_pos, source_path=None):
         from canvas.image_item import ImageItem
         from canvas.slot_item import TemplateSlotItem
+
+        scene = self.scene()
+        if scene is None:
+            return
+
+        # ФИКС (баг 1): drag&drop теперь добавляет изображение через
+        # undo-стек (AddItemCommand), как и добавление через меню —
+        # раньше перетащенную картинку нельзя было отменить через Ctrl+Z.
+        window = self.window()
+        undo_stack = getattr(window, "undo_stack", None)
 
         scene_pos = self.mapToScene(view_pos.toPoint())
 
         # Если мы в template mode — попытаемся положить изображение в слот
-        scene = self.scene()
         if getattr(scene, "is_template_mode", False):
-            # Ищем слот под курсором
-            items = scene.items(scene_pos)
             slot = None
-            for it in items:
+            for it in scene.items(scene_pos):
                 if isinstance(it, TemplateSlotItem):
                     slot = it
                     break
 
             if slot is not None:
-                item = ImageItem(pixmap)
-                # Добавляем на сцену и делегируем слоту управление позиционированием
-                scene.addItem(item)
-                try:
-                    delay = getattr(self.scene, 'swap_delay_ms', None)
-                    if delay is not None and hasattr(item, '_hover_timer'):
-                        item._hover_timer.setInterval(delay)
-                except Exception:
-                    pass
-                slot.accept_image(item)
+                # Снимаем предыдущее выделение,
+                # чтобы не выделялись сразу все добавленные элементы
+                scene.clearSelection()
+
+                item = ImageItem(pixmap, source_path)
+                self._apply_swap_delay(scene, item)
+
+                if undo_stack is not None:
+                    # AddItemCommand со слотом: redo добавляет на сцену
+                    # и помещает в слот, undo очищает ссылку слота
+                    undo_stack.push(AddItemCommand(scene, item, slot))
+                else:
+                    scene.addItem(item)
+                    slot.accept_image(item)
+
                 item.setSelected(True)
                 return
 
         # Обычное поведение — свободный ImageItem
-        item = ImageItem(pixmap)
+        scene.clearSelection()
+
+        item = ImageItem(pixmap, source_path)
         item.setPos(
             scene_pos
             - QPointF(pixmap.width() / 2, pixmap.height() / 2)
         )
+        self._apply_swap_delay(scene, item)
 
-        self.scene().addItem(item)
-        try:
-            delay = getattr(self.scene, 'swap_delay_ms', None)
-            if delay is not None and hasattr(item, '_hover_timer'):
-                item._hover_timer.setInterval(delay)
-        except Exception:
-            pass
+        if undo_stack is not None:
+            undo_stack.push(AddItemCommand(scene, item))
+        else:
+            scene.addItem(item)
 
         item.setSelected(True)
 
+    @staticmethod
+    def _apply_swap_delay(scene, item):
+        # ФИКС (пункт 3/4 ревью): раньше здесь было getattr(self.scene, ...) —
+        # обращение к МЕТОДУ scene, а не к сцене, поэтому задержка
+        # никогда не применялась (баг был скрыт try/except: pass).
+        delay = getattr(scene, "swap_delay_ms", None)
+        if delay is not None and hasattr(item, "_hover_timer"):
+            item._hover_timer.setInterval(int(delay))
 
-    def _add_image(self, path: str, view_pos):
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            return
-
-        scene_pos = self.mapToScene(view_pos.toPoint())
-
-        item = ImageItem(pixmap)
-        item.setPos(scene_pos - QPointF(pixmap.width() / 2, pixmap.height() / 2))
-
-        self.scene().addItem(item)
+    # ФИКС (баг 2): раньше зум отслеживался двумя независимыми
+    # переменными: _zoom (кнопки +/-) и zoom_percent (Ctrl+колесо,
+    # диалог "Масштаб..."), которые не синхронизировались между
+    # собой. Теперь единственный ис  очник истины — zoom_percent,
+    # а все пути изменения масштаба проходят через set_zoom_percent().
 
     def zoom_in(self):
-        self._apply_zoom(1.1)
+        self.set_zoom_percent(round(self.zoom_percent * 1.1))
 
     def zoom_out(self):
-        self._apply_zoom(0.9)
+        self.set_zoom_percent(round(self.zoom_percent / 1.1))
 
     def reset_zoom(self):
-        self.resetTransform()
-        self._zoom = 1.0
-        self._emit_zoom_changed()
-
-    def _apply_zoom(self, factor):
-        new_zoom = self._zoom * factor
-        if not 0.1 <= new_zoom <= 5.0:
-            return
-
-        self.scale(factor, factor)
-        self._zoom = new_zoom
-
-        window = self.window()
-        if hasattr(window, "update_zoom_label"):
-            window.update_zoom_label(self._zoom)
-
-    def _emit_zoom_changed(self):
-        window = self.window()
-        if hasattr(window, "update_zoom_label"):
-            window.update_zoom_label(self._zoom)
+        self.set_zoom_percent(100)
 
     def set_zoom_percent(self, percent: int):
-        percent = max(10, min(percent, 800))
+        percent = max(10, min(int(round(percent)), 800))
 
         self.resetTransform()
         factor = percent / 100.0
         self.scale(factor, factor)
 
         self.zoom_percent = percent
+        self._zoom = factor
 
-        if hasattr(self.parent(), "update_zoom_label"):
-            self.parent().update_zoom_label(percent)
+        window = self.window()
+        if hasattr(window, "update_zoom_label"):
+            window.update_zoom_label(percent)
 
     def _return_selected_item_to_preview(self):
         scene = self.scene()
@@ -340,11 +364,19 @@ class GraphicsView(QGraphicsView):
         if not hasattr(window, "preview_panel"):
             return
 
-        # 1️⃣ добавляем в превью
-        window.preview_panel.add_pixmap(pixmap)
-
-        # 2️⃣ удаляем с холста
-        scene.removeItem(item)
+        # ФИКС (баг 3): возврат в превью и удаление с холста — одна
+        # атомарная undo-команда. Раньше в превью добавляли напрямую,
+        # и после Ctrl+Z изображение возвращалось на холст, но его
+        # копия оставалась в панели превью.
+        if hasattr(window, "undo_stack"):
+            window.undo_stack.push(
+                ReturnToPreviewCommand(scene, window, item)
+            )
+        else:
+            window.preview_panel.add_pixmap(
+                pixmap, getattr(item, "source_path", None)
+            )
+            scene.removeItem(item)
 
 
 class MainWindow(QMainWindow):
@@ -356,11 +388,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(i18n.t('app_title'))
         self.resize(1200, 800)
         # Открывать приложение в развернутом (максимизированном) окне
-        try:
-            self.showMaximized()
-        except Exception:
-            # fallback: установить состояние окна как максимизированное
-            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+        self.showMaximized()
 
         self.undo_stack = QUndoStack(self)
 
@@ -370,12 +398,11 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self.view)
         self.view.setAcceptDrops(True)
-        
 
         self.zoom_label = QLabel("100%")
         self.statusBar().addPermanentWidget(self.zoom_label)
 
-        # Добавляем кнопки масштаба справа снизу
+        # Добавляем кно  ки масштаба справа снизу
         self.zoom_minus = QPushButton("-", self)
         self.zoom_minus.setFixedSize(24, 24)
         self.zoom_minus.clicked.connect(lambda: self.view.zoom_out())
@@ -386,23 +413,16 @@ class MainWindow(QMainWindow):
         self.zoom_plus.clicked.connect(lambda: self.view.zoom_in())
         self.statusBar().addPermanentWidget(self.zoom_plus)
 
-        # Кнопка для регенерации случайной сетки в TEMPLATE режиме (иконка только)
+        # Кнопка для регенерации случайной сетки в TEMPLATE режиме
         self.regen_grid_btn = QToolButton(self)
-        try:
-            icon = QIcon('assets/icons/new_grid.svg')
-            if not icon.isNull():
-                self.regen_grid_btn.setIcon(icon)
-                self.regen_grid_btn.setIconSize(QSize(18, 18))
-        except Exception:
-            pass
+        icon = QIcon('assets/icons/new_grid.svg')
+        if not icon.isNull():
+            self.regen_grid_btn.setIcon(icon)
+            self.regen_grid_btn.setIconSize(QSize(18, 18))
 
         self.regen_grid_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.regen_grid_btn.clicked.connect(self.regenerate_template_grid)
-        # Локализованная подсказка
-        try:
-            self.regen_grid_btn.setToolTip(i18n.t('new_grid_tooltip'))
-        except Exception:
-            pass
+        self.regen_grid_btn.setToolTip(i18n.t('new_grid_tooltip'))
 
         self.statusBar().addPermanentWidget(self.regen_grid_btn)
 
@@ -411,8 +431,6 @@ class MainWindow(QMainWindow):
         self.collage_mode = CollageMode.FREE
         self._create_menu()
 
-
-
     # ---------- Menu ----------
     def _create_menu(self):
         self.menuBar().clear()
@@ -420,6 +438,16 @@ class MainWindow(QMainWindow):
         new_action = QAction(i18n.t('new_collage'), self)
         new_action.triggered.connect(self.create_new_collage)
         file_menu.addAction(new_action)
+
+        open_project_action = QAction(i18n.t('open_project'), self)
+        open_project_action.setShortcut("Ctrl+Shift+O")
+        open_project_action.triggered.connect(self.open_project)
+        file_menu.addAction(open_project_action)
+
+        save_project_action = QAction(i18n.t('save_project'), self)
+        save_project_action.setShortcut("Ctrl+S")
+        save_project_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_project_action)
 
         add_image_action = QAction(i18n.t('add_image'), self)
         add_image_action.setShortcut("Ctrl+O")
@@ -471,7 +499,7 @@ class MainWindow(QMainWindow):
 
         # Добавляем новые действия для зеркалирования
         mirror_menu = self.menuBar().addMenu(i18n.t('image_menu'))
-        
+
         horizontal_mirror_action = QAction(i18n.t('mirror_h'), self)
         horizontal_mirror_action.setShortcut("Ctrl+Shift+H")
         horizontal_mirror_action.triggered.connect(self.horizontal_mirror)
@@ -515,14 +543,20 @@ class MainWindow(QMainWindow):
         ru_action.triggered.connect(lambda: self.set_language('ru'))
         en_action = QAction(i18n.t('english'), self)
         en_action.triggered.connect(lambda: self.set_language('en'))
+        es_action = QAction(i18n.t('spanish'), self)
+        es_action.triggered.connect(lambda: self.set_language('es'))
         language_menu.addAction(ru_action)
         language_menu.addAction(en_action)
+        language_menu.addAction(es_action)
 
     # ---------- Helpers ----------
 
     def open_github(self):
         """Открывает страницу GitHub в браузере."""
         url = "https://github.com/re-quies/fastcollageforwin"  # Замените на ссылку вашего репозитория
+        if not url:
+            logger.warning("GitHub URL is not configured; nothing to open")
+            return
         webbrowser.open(url)
 
     def _selected_item(self):
@@ -533,9 +567,9 @@ class MainWindow(QMainWindow):
     def add_image(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выбрать изображение",
+            i18n.t('choose_image'),
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp)"
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
         )
 
         if not file_path:
@@ -543,49 +577,96 @@ class MainWindow(QMainWindow):
 
         pixmap = QPixmap(file_path)
         if pixmap.isNull():
+            logger.warning("Failed to load image from %s", file_path)
             return
 
-        item = ImageItem(pixmap)
+        item = ImageItem(pixmap, file_path)
         item.setPos(0, 0)
         item.setSelected(True)
 
         # Устанавливаем задержку swap для нового элемента
-        try:
-            delay = getattr(self.scene, 'swap_delay_ms', None)
-            if delay is not None and hasattr(item, '_hover_timer'):
-                item._hover_timer.setInterval(delay)
-        except Exception:
-            pass
+        delay = getattr(self.scene, 'swap_delay_ms', None)
+        if delay is not None and hasattr(item, '_hover_timer'):
+            item._hover_timer.setInterval(int(delay))
 
         cmd = AddItemCommand(self.scene, item)
         self.undo_stack.push(cmd)
 
-    def bring_to_front(self):
+    def _layer_target(self):
+        """Элемент, к которому применяются команды слоёв.
+
+        Если выбран слот шаблона ИЛИ изображение внутри слота —
+        слоями управляем на уровне слота (изображение — его часть
+        и поднимается/опускается вместе со слотом).
+        """
         item = self._selected_item()
+        if item is None:
+            return None
+
+        if isinstance(item, TemplateSlotItem):
+            return item
+
+        parent = item.parentItem()
+        if isinstance(parent, TemplateSlotItem):
+            return parent
+
+        return item
+
+    def bring_to_front(self):
+        item = self._layer_target()
         if not item:
             return
 
-        max_z = max((i.zValue() for i in self.scene.items()), default=0)
+        # Слоты сравниваем только между собой (по базовому слою,
+        # без учёта временной подсветки при перетаскивании)
+        if isinstance(item, TemplateSlotItem):
+            slots = getattr(self.scene, "template_slots", [])
+            max_z = max((s.base_z() for s in slots), default=0.0)
+            item.set_base_z(max_z + 1)
+            return
+
+        max_z = max(
+            (i.zValue() for i in self.scene.items()
+             if isinstance(i, ImageItem)),
+            default=0,
+        )
         item.setZValue(max_z + 1)
 
     def send_to_back(self):
-        item = self._selected_item()
+        item = self._layer_target()
         if not item:
             return
 
-        min_z = min((i.zValue() for i in self.scene.items()), default=0)
+        if isinstance(item, TemplateSlotItem):
+            slots = getattr(self.scene, "template_slots", [])
+            min_z = min((s.base_z() for s in slots), default=0.0)
+            item.set_base_z(min_z - 1)
+            return
+
+        min_z = min(
+            (i.zValue() for i in self.scene.items()
+             if isinstance(i, ImageItem)),
+            default=0,
+        )
         item.setZValue(min_z - 1)
 
     def export_image(self):
-        file_path, _ = QFileDialog.getSaveFileName(
+        file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Экспорт изображения",
+            i18n.t('export_image'),
             "",
             "PNG (*.png);;JPEG (*.jpg *.jpeg)"
         )
 
         if not file_path:
             return
+
+        # ФИКС (баг 5): если пользователь не указал расширение —
+        # подставляем его из выбранного фильтра, иначе QImage.save
+        # не сможет определить формат и молча откажет.
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg"):
+            file_path += ".jpg" if "JPEG" in selected_filter else ".png"
 
         rect = self.scene.sceneRect()
         image = QImage(
@@ -599,26 +680,22 @@ class MainWindow(QMainWindow):
         prev_suppress = getattr(self.scene, 'suppress_visuals', False)
         self.scene.suppress_visuals = True
 
-        # Удаляем визуальные индикаторы hover у ImageItem'ов (например "Release to drop")
-        try:
-            for it in list(self.scene.items()):
+        # Удаляем визуальные индикаторы hover у ImageItem'ов
+        for it in list(self.scene.items()):
+            if hasattr(it, '_clear_hover_indicator'):
                 try:
-                    if hasattr(it, '_clear_hover_indicator'):
-                        it._clear_hover_indicator()
+                    it._clear_hover_indicator()
                 except Exception:
-                    pass
-        except Exception:
-            pass
+                    logger.exception(
+                        "Failed to clear hover indicator before export"
+                    )
 
         # Сохраняем предыдущее состояние подсветки слотов, затем отключаем их
-        prev_highlights = []
-        try:
-            for slot in getattr(self.scene, 'template_slots', []):
-                prev_highlights.append(bool(getattr(slot, '_highlighted', False)))
-                slot.set_highlight(False)
-                slot._update_handles()
-        except Exception:
-            prev_highlights = []
+        slots = getattr(self.scene, 'template_slots', [])
+        prev_highlights = [bool(getattr(s, '_highlighted', False)) for s in slots]
+        for slot in slots:
+            slot.set_highlight(False)
+            slot._update_handles()
 
         self.scene.update()
 
@@ -627,15 +704,18 @@ class MainWindow(QMainWindow):
         painter.end()
 
         # Восстановим состояние визуализации
-        try:
-            for slot, prev in zip(getattr(self.scene, 'template_slots', []), prev_highlights):
-                slot.set_highlight(prev)
-                slot._update_handles()
-        except Exception:
-            pass
+        for slot, prev in zip(slots, prev_highlights):
+            slot.set_highlight(prev)
+            slot._update_handles()
         self.scene.suppress_visuals = prev_suppress
 
-        image.save(file_path)
+        if not image.save(file_path):
+            # ФИКС (баг 5): сообщаем об ошибке пользователю,
+            # а не только в лог
+            logger.error("Failed to save exported image to %s", file_path)
+            QMessageBox.critical(
+                self, i18n.t('error'), i18n.t('export_failed')
+            )
 
     def change_canvas_size(self):
         dialog = CanvasSizeDialog(
@@ -671,8 +751,16 @@ class MainWindow(QMainWindow):
         return self.scene
 
     def delete_selected(self):
-        for item in self.scene.selectedItems():
-            self.scene.removeItem(item)
+        # Пункт 4: удаление через undo-стек + очистка ссылок слотов.
+        # Слоты шаблона клавишей Delete не удаляются — только изображения
+        items = [
+            it for it in self.scene.selectedItems()
+            if not isinstance(it, TemplateSlotItem)
+        ]
+        if not items:
+            return
+
+        self.undo_stack.push(DeleteItemsCommand(self.scene, items))
 
     def change_swap_delay(self):
         value, ok = QInputDialog.getInt(
@@ -687,38 +775,28 @@ class MainWindow(QMainWindow):
 
         if ok:
             self.swap_delay_ms = value
-            if hasattr(self.scene, 'swap_delay_ms'):
-                self.scene.swap_delay_ms = value
+            self.scene.swap_delay_ms = value
 
             # Обновляем существующие ImageItem'ы
             for it in self.scene.items():
-                try:
-                    if hasattr(it, '_hover_timer'):
-                        it._hover_timer.setInterval(value)
-                except Exception:
-                    pass
+                if hasattr(it, '_hover_timer'):
+                    it._hover_timer.setInterval(value)
 
     def set_language(self, lang: str):
-        import i18n as _i18n
-        _i18n.set_lang(lang)
+        i18n.set_lang(lang)
         # Пересобираем меню и обновляем тексты
-        self.setWindowTitle(_i18n.t('app_title'))
+        self.setWindowTitle(i18n.t('app_title'))
         self._create_menu()
-        # Обновляем заголовок панели превью
-        try:
-            self.preview_panel.setWindowTitle(_i18n.t('images'))
-        except Exception:
-            pass
+        # Обновляем заголовок панели превью и подсказку кнопки сетки
+        self.preview_panel.setWindowTitle(i18n.t('images'))
+        self.regen_grid_btn.setToolTip(i18n.t('new_grid_tooltip'))
 
     def update_zoom_label(self, percent):
         # percent может быть float (масштаб 1.0) или int (проценты)
-        try:
-            if isinstance(percent, float):
-                value = int(round(percent * 100))
-            else:
-                value = int(round(percent))
-        except Exception:
-            value = percent
+        if isinstance(percent, float):
+            value = int(round(percent * 100))
+        else:
+            value = int(round(percent))
 
         self.zoom_label.setText(f"{value}%")
 
@@ -736,13 +814,85 @@ class MainWindow(QMainWindow):
         if ok:
             self.view.set_zoom_percent(value)
 
+    # ---------- Project save / load ----------
+
+    def save_project(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            i18n.t('save_project'),
+            "",
+            "FastCollage Project (*.fcproj);;JSON (*.json)"
+        )
+        if not file_path:
+            return
+
+        data, skipped = project_io.serialize(self)
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            logger.exception("Failed to save project to %s", file_path)
+            QMessageBox.critical(
+                self, i18n.t('error'), i18n.t('project_save_failed')
+            )
+            return
+
+        if skipped:
+            QMessageBox.warning(
+                self, i18n.t('app_title'), i18n.t('unsaved_images')
+            )
+
+    def open_project(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            i18n.t('open_project'),
+            "",
+            "FastCollage Project (*.fcproj *.json)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            logger.exception("Failed to load project from %s", file_path)
+            QMessageBox.critical(
+                self, i18n.t('error'), i18n.t('project_load_failed')
+            )
+            return
+
+        try:
+            missing = project_io.apply(self, data)
+        except ValueError:
+            logger.exception("Invalid project file %s", file_path)
+            QMessageBox.critical(
+                self, i18n.t('error'), i18n.t('project_load_failed')
+            )
+            return
+
+        if missing:
+            QMessageBox.warning(
+                self,
+                i18n.t('app_title'),
+                i18n.t('missing_images') + "\n" + "\n".join(missing[:10]),
+            )
+
     def create_new_collage(self):
         dialog = StartCollageDialog(self)
         if not dialog.exec():
             return
 
-        data = dialog.result_data()
+        self.create_new_collage_from_data(dialog.result_data())
+
+    def create_new_collage_from_data(self, data):
         self.collage_mode = data["mode"]
+
+        # Пункт 2: очищаем историю undo — старые команды ссылаются на
+        # элементы прежней сцены, и Ctrl+Z после нового коллажа мог бы
+        # менять уже несуществующую сцену.
+        self.undo_stack.clear()
 
         # --- TEMPLATE MODE ---
         if self.collage_mode == CollageMode.TEMPLATE:
@@ -764,78 +914,37 @@ class MainWindow(QMainWindow):
         # ВАЖНО: setScene ОДИН раз
         self.view.setScene(self.scene)
 
-    def create_new_collage_from_data(self, data):
-        self.collage_mode = data["mode"]
-
-        if self.collage_mode == CollageMode.TEMPLATE:
-            w, h = data["canvas_size"]
-            self.scene = CanvasScene(w, h)
-            self.scene.swap_delay_ms = self.swap_delay_ms
-            self.scene.is_template_mode = True
-            self.scene.template_image_count = data["count"]
-            self.scene.build_template()
-        else:
-            # В свободном режиме используем выбранный размер холста
-            w, h = data.get("canvas_size", (1920, 1080))
-            self.scene = CanvasScene(w, h)
-            self.scene.swap_delay_ms = self.swap_delay_ms
-
-        self.view.setScene(self.scene)
-
     def regenerate_template_grid(self):
         """Обработчик кнопки: регенерация сетки только в TEMPLATE режиме."""
-        # Если текущее состояние не шаблон — ничего не делаем
         if self.collage_mode != CollageMode.TEMPLATE:
             return
 
-        # Если сцена не в шаблонном режиме — ничего не делаем
         scene = self.get_active_scene()
         if not getattr(scene, 'is_template_mode', False):
             return
 
-        # Если нет ни одного изображения на холсте и ни в слотах — подтверждение не требуем
-        try:
-            images_present = False
-
-            # 1) Ищем ImageItem по наличию атрибута original_pixmap
-            try:
-                for it in scene.items():
-                    if hasattr(it, 'original_pixmap'):
-                        images_present = True
-                        break
-            except Exception:
-                images_present = False
-
-            # 2) Также проверяем, есть ли в слотах связанные изображения
-            try:
-                if not images_present:
-                    for slot in getattr(scene, 'template_slots', []):
-                        if getattr(slot, 'image_item', None) is not None:
-                            images_present = True
-                            break
-            except Exception:
-                pass
-        except Exception:
-            images_present = True
+        # Есть ли изображения на холсте или в слотах
+        images_present = any(
+            hasattr(it, 'original_pixmap') for it in scene.items()
+        ) or any(
+            getattr(slot, 'image_item', None) is not None
+            for slot in getattr(scene, 'template_slots', [])
+        )
 
         # Если есть изображения — попросим подтверждение перед удалением
         if images_present:
-            try:
-                msg = QMessageBox(self)
-                msg.setWindowTitle(i18n.t('confirm_regen_title'))
-                msg.setText(i18n.t('confirm_regen_text'))
-                msg.setIcon(QMessageBox.Warning)
-                yes = msg.addButton(i18n.t('confirm'), QMessageBox.AcceptRole)
-                no = msg.addButton(i18n.t('cancel'), QMessageBox.RejectRole)
-                msg.exec()
-                if msg.clickedButton() is not yes:
-                    return
-            except Exception:
-                # Если диалог не доступен — продолжаем
-                pass
+            msg = QMessageBox(self)
+            msg.setWindowTitle(i18n.t('confirm_regen_title'))
+            msg.setText(i18n.t('confirm_regen_text'))
+            msg.setIcon(QMessageBox.Warning)
+            yes = msg.addButton(i18n.t('confirm'), QMessageBox.AcceptRole)
+            msg.addButton(i18n.t('cancel'), QMessageBox.RejectRole)
+            msg.exec()
+            if msg.clickedButton() is not yes:
+                return
 
-        # Перестроим шаблон (CanvasScene.build_template отвечает за очистку старых слотов)
-        try:
-            scene.build_template()
-        except Exception:
-            pass
+        # Перестроим шаблон (CanvasScene.build_template отвечает за очистку)
+        scene.build_template()
+
+        # История undo может ссылаться на удалённые слоты/изображения (пункт 2)
+        self.undo_stack.clear()

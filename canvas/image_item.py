@@ -1,16 +1,25 @@
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsSimpleTextItem
-from PySide6.QtGui import QPen, QPixmap, QTransform, QFont, QColor
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
+import logging
 import time
+
+from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsSimpleTextItem
+from PySide6.QtGui import QPen, QPixmap, QFont, QColor, QPainter
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
+
+import i18n
+
+logger = logging.getLogger(__name__)
 
 
 class ImageItem(QGraphicsPixmapItem):
-    def __init__(self, pixmap: QPixmap):
+    def __init__(self, pixmap: QPixmap, source_path=None):
         super().__init__(pixmap)
 
         # ====== ОРИГИНАЛ ======
         self.original_pixmap = pixmap
         self.base_size = pixmap.size()
+
+        # Путь к исходному файлу (для панели превью и сохранения проекта)
+        self.source_path = source_path
 
         # ====== ZOOM CONTENT ======
         self.zoom_factor = 1.0
@@ -23,6 +32,15 @@ class ImageItem(QGraphicsPixmapItem):
         self._panning = False
         self._last_mouse_pos = None
 
+        # ====== PAN INSIDE SLOT ======
+        # Смещение относительно центра слота (панорамирование внутри слота).
+        # Ограничивается в TemplateSlotItem.position_image так, чтобы слот
+        # всегда оставался полностью покрыт изображением.
+        self.slot_offset = QPointF(0, 0)
+        self._slot_panning = False
+        self._slot_pan_last = None
+        self._slot_pan_old_offset = None
+
         # ====== FLAGS ======
         self.setFlags(
             QGraphicsPixmapItem.ItemIsMovable
@@ -33,10 +51,11 @@ class ImageItem(QGraphicsPixmapItem):
         self.setAcceptHoverEvents(True)
         self.setTransformOriginPoint(self.boundingRect().center())
 
-        # ====== ZOOM & MIRROR STATE ======
+        # ====== СОСТОЯНИЕ ДО ПЕРЕТАСКИВАНИЯ ======
         self._old_pos = self.pos()
         self._old_scale = self.scale()
         self._old_rotation = self.rotation()
+        self._old_parent_slot = None
 
         # Флаги для зеркалирования
         self.mirrored_horizontal = False
@@ -56,97 +75,170 @@ class ImageItem(QGraphicsPixmapItem):
         self._hover_indicator_interval = 100  # ms
         self._hover_ready = False
 
+    # ---------- Helpers ----------
+
+    def _window(self):
+        """Главное окно приложения (или None, если недоступно)."""
+        scene = self.scene()
+        if scene is None or not scene.views():
+            return None
+        return scene.views()[0].window()
+
+    def _find_slot_at(self, scene, scene_pos):
+        """Найти слот шаблона под точкой сцены."""
+        from canvas.slot_item import TemplateSlotItem
+
+        for it in scene.items(scene_pos):
+            if isinstance(it, TemplateSlotItem):
+                return it
+        return None
+
     def _clear_hover_indicator(self):
-        try:
-            if self._hover_countdown_timer is not None:
-                try:
-                    self._hover_countdown_timer.stop()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if self._hover_countdown_timer is not None:
+            self._hover_countdown_timer.stop()
+            self._hover_countdown_timer = None
 
-        try:
-            if self._hover_indicator is not None:
-                scene = self.scene()
-                if scene is not None:
-                    try:
-                        scene.removeItem(self._hover_indicator)
-                    except Exception:
-                        pass
-                self._hover_indicator = None
-        except Exception:
-            pass
+        if self._hover_indicator is not None:
+            scene = self.scene()
+            if scene is not None and self._hover_indicator.scene() is scene:
+                scene.removeItem(self._hover_indicator)
+            self._hover_indicator = None
 
-        self._hover_countdown_timer = None
         self._hover_end_ts = None
 
     def paint(self, painter, option, widget=None):
-        super().paint(painter, option, widget)
+        """Отрисовка без потери качества.
+
+        ФИКС: раньше зум содержимого и зеркалирование "выпекались"
+        в новый пиксмап (кроп + растяжка обратно до base_size), из-за
+        чего терялись реальные пиксели — мыло попадало и в экспорт
+        (scene.render рисовал уже деградированную версию). Теперь зум
+        и зеркалирование — параметры отрисовки: видимое окно оригинала
+        (sourceRect) рисуется напрямую в boundingRect элемента, а QPainter
+        интерполирует в разрешении текущего вывода (экран/экспорт).
+        Бонус: панорамирование больше не копирует пиксмап на каждый
+        mouse move и движется субпиксельно плавно (QRectF без округления).
+        """
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        target = QRectF(
+            0, 0, self.base_size.width(), self.base_size.height()
+        )
+        source = self._visible_source_rect()
+
+        painter.save()
+        if self.mirrored_horizontal or self.mirrored_vertical:
+            cx = target.width() / 2
+            cy = target.height() / 2
+            painter.translate(cx, cy)
+            painter.scale(
+                -1.0 if self.mirrored_horizontal else 1.0,
+                -1.0 if self.mirrored_vertical else 1.0,
+            )
+            painter.translate(-cx, -cy)
+        painter.drawPixmap(target, self.original_pixmap, source)
+        painter.restore()
 
         # Рисуем рамку выделения только если сцена не просит скрыть визуалы
-        try:
-            scene = self.scene()
-            suppress = bool(getattr(scene, 'suppress_visuals', False))
-        except Exception:
-            suppress = False
+        scene = self.scene()
+        suppress = bool(getattr(scene, 'suppress_visuals', False))
 
         if self.isSelected() and not suppress:
             pen = QPen(Qt.blue, 2, Qt.DashLine)
             painter.setPen(pen)
             painter.drawRect(self.boundingRect())
 
-    def zoom_content(self, factor: float):
-        """Масштабируем содержимое, учитывая зеркалирование"""
-        self.zoom_factor = max(1.0, min(self.zoom_factor * factor, 8.0))
-        self._update_visible_pixmap()
-
-    def _update_visible_pixmap(self):
+    def _visible_source_rect(self) -> QRectF:
+        """Видимое окно оригинала с учётом зума и центра (в координатах
+        original_pixmap). Окно ограничено границами изображения."""
         w = self.original_pixmap.width() / self.zoom_factor
         h = self.original_pixmap.height() / self.zoom_factor
 
         x = self.zoom_center.x() - w / 2
         y = self.zoom_center.y() - h / 2
 
-        x = max(0, min(x, self.original_pixmap.width() - w))
-        y = max(0, min(y, self.original_pixmap.height() - h))
+        x = max(0.0, min(x, self.original_pixmap.width() - w))
+        y = max(0.0, min(y, self.original_pixmap.height() - h))
 
-        rect = QRectF(x, y, w, h)
+        return QRectF(x, y, w, h)
 
-        cropped = self.original_pixmap.copy(rect.toRect())
+    def _clamp_zoom_center(self):
+        """Удерживаем центр зума в допустимых пределах, чтобы окно
+        не выходило за границы и не накапливался "мёртвый ход"
+        при панорамировании у края."""
+        w = self.original_pixmap.width() / self.zoom_factor
+        h = self.original_pixmap.height() / self.zoom_factor
 
-        # Применяем зеркалирование
-        if self.mirrored_horizontal:
-            cropped = cropped.transformed(QTransform(-1, 0, 0, 1, 0, 0))  # зеркалирование по горизонтали
-
-        if self.mirrored_vertical:
-            cropped = cropped.transformed(QTransform(1, 0, 0, -1, 0, 0))  # зеркалирование по вертикали
-
-        # ВАЖНО: возвращаем к исходному размеру
-        scaled = cropped.scaled(
-            self.base_size,
-            Qt.IgnoreAspectRatio,
-            Qt.SmoothTransformation
+        self.zoom_center = QPointF(
+            max(w / 2, min(
+                self.zoom_center.x(),
+                self.original_pixmap.width() - w / 2,
+            )),
+            max(h / 2, min(
+                self.zoom_center.y(),
+                self.original_pixmap.height() - h / 2,
+            )),
         )
 
-        self.setPixmap(scaled)
+    def zoom_content(self, factor: float):
+        """Масштабируем содержимое (без пересоздания пиксмапа)"""
+        self.zoom_factor = max(1.0, min(self.zoom_factor * factor, 8.0))
+        self._clamp_zoom_center()
+        self.update()
 
     def mirror_image(self, axis: str):
-        """Применяем зеркалирование изображения"""
+        """Применяем зеркалирование изображения (без потери качества)"""
         if axis == 'horizontal':
             self.mirrored_horizontal = not self.mirrored_horizontal
         elif axis == 'vertical':
             self.mirrored_vertical = not self.mirrored_vertical
 
-        self._update_visible_pixmap()
+        self.update()
+
+    # ---------- Project serialization ----------
+
+    def view_state(self) -> dict:
+        """Состояние отображения содержимого (для сохранения проекта)."""
+        return {
+            "zoom_factor": self.zoom_factor,
+            "zoom_center": [self.zoom_center.x(), self.zoom_center.y()],
+            "mirrored_horizontal": self.mirrored_horizontal,
+            "mirrored_vertical": self.mirrored_vertical,
+            "slot_offset": [self.slot_offset.x(), self.slot_offset.y()],
+        }
+
+    def apply_view_state(self, state: dict):
+        """Восстановить состояние отображения (при загрузке проекта)."""
+        self.zoom_factor = float(state.get("zoom_factor", 1.0))
+
+        center = state.get("zoom_center")
+        if isinstance(center, (list, tuple)) and len(center) == 2:
+            self.zoom_center = QPointF(float(center[0]), float(center[1]))
+
+        offset = state.get("slot_offset")
+        if isinstance(offset, (list, tuple)) and len(offset) == 2:
+            self.slot_offset = QPointF(float(offset[0]), float(offset[1]))
+
+        self.mirrored_horizontal = bool(state.get("mirrored_horizontal", False))
+        self.mirrored_vertical = bool(state.get("mirrored_vertical", False))
+
+        # Пиксмап больше не "выпекается" — зум/зеркалирование
+        # применяются при отрисовке (см. paint)
+        self._clamp_zoom_center()
+        self.update()
+
+    # ---------- Mouse events ----------
 
     def mousePressEvent(self, event):
+        from canvas.slot_item import TemplateSlotItem
+
         self._old_pos = self.pos()
         self._old_scale = self.scale()
         self._old_rotation = self.rotation()
-        # Track parent slot (если есть)
+
+        # Запоминаем родительский слот (если есть)
         parent = self.parentItem()
-        self._old_parent_slot = parent if parent and type(parent).__name__ == 'TemplateSlotItem' else None
+        self._old_parent_slot = parent if isinstance(parent, TemplateSlotItem) else None
 
         # Проверяем режим во View, а не клавишу
         scene = self.scene()
@@ -158,177 +250,216 @@ class ImageItem(QGraphicsPixmapItem):
                 event.accept()
                 return
 
+            # Панорамирование внутри слота: зажата C (или Alt),
+            # а изображение находится в слоте шаблона
+            slot_pan = (
+                getattr(view, "slot_pan_mode", False)
+                or bool(event.modifiers() & Qt.AltModifier)
+            )
+            if slot_pan and self._old_parent_slot is not None:
+                self._slot_panning = True
+                self._slot_pan_last = event.scenePos()
+                self._slot_pan_old_offset = QPointF(self.slot_offset)
+                event.accept()
+                return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._slot_panning:
+            from canvas.slot_item import TemplateSlotItem
+
+            parent = self.parentItem()
+            if isinstance(parent, TemplateSlotItem):
+                # Слот не масштабируется и не поворачивается, поэтому
+                # дельта сцены совпадает с дельтой в координатах слота
+                delta = event.scenePos() - self._slot_pan_last
+                self._slot_pan_last = event.scenePos()
+                self.slot_offset = QPointF(
+                    self.slot_offset.x() + delta.x(),
+                    self.slot_offset.y() + delta.y(),
+                )
+                parent.position_image(self)
+            event.accept()
+            return
+
         if self._panning:
             delta = event.pos() - self._last_mouse_pos
             self._last_mouse_pos = event.pos()
 
+            # Панорамирование содержимого: только сдвиг центра +
+            # перерисовка — без копирования пиксмапа на каждый mouse move
             self.zoom_center -= delta / self.zoom_factor
-            self._update_visible_pixmap()
+            self._clamp_zoom_center()
+            self.update()
             event.accept()
             return
 
         super().mouseMoveEvent(event)
 
-        # При перемещении отслеживаем, над каким слотом находится центр — запускаем таймер для swap
+        # При перемещении отслеживаем, над каким слотом находится курсор —
+        # запускаем таймер для swap
         scene = self.scene()
         if not scene or not getattr(scene, "is_template_mode", False):
             return
 
-        # Используем позицию курсора в сцене, чтобы определять слот-кандидат.
-        try:
-            cursor_pos = event.scenePos()
-        except Exception:
-            cursor_pos = self.mapToScene(self.boundingRect().center())
-        items = scene.items(cursor_pos)
-        new_slot = None
         from canvas.slot_item import TemplateSlotItem
-        for it in items:
-            if isinstance(it, TemplateSlotItem):
-                new_slot = it
-                break
+
+        cursor_pos = event.scenePos()
+        new_slot = self._find_slot_at(scene, cursor_pos)
 
         # Если у нас был родительский слот и мы всё ещё преимущественно внутри него,
         # игнорируем попадание в соседний слот (требуется >50% вне зоны для смены).
-        try:
-            parent = self.parentItem()
-            if parent is not None and type(parent).__name__ == 'TemplateSlotItem' and new_slot is not None and new_slot is not parent:
-                # Рассчитываем площадь пересечения в координатах сцены
-                item_rect = self.mapToScene(self.boundingRect()).boundingRect()
-                parent_rect = QRectF(parent.scenePos().x(), parent.scenePos().y(), parent.rect().width(), parent.rect().height())
-                inter = item_rect.intersected(parent_rect)
-                inter_area = max(0.0, inter.width() * inter.height())
-                item_area = max(1.0, item_rect.width() * item_rect.height())
-                # Если пересечение >= 50% — остаёмся в текущем слоте
-                if inter_area / item_area >= 0.5:
-                    new_slot = parent
-        except Exception:
-            pass
+        parent = self.parentItem()
+        if (
+            isinstance(parent, TemplateSlotItem)
+            and new_slot is not None
+            and new_slot is not parent
+        ):
+            item_rect = self.mapToScene(self.boundingRect()).boundingRect()
+            parent_rect = QRectF(
+                parent.scenePos().x(),
+                parent.scenePos().y(),
+                parent.rect().width(),
+                parent.rect().height(),
+            )
+            inter = item_rect.intersected(parent_rect)
+            inter_area = max(0.0, inter.width() * inter.height())
+            item_area = max(1.0, item_rect.width() * item_rect.height())
+            # Если пересечение >= 50% — остаёмся в текущем слоте
+            if inter_area / item_area >= 0.5:
+                new_slot = parent
 
         if new_slot is not self._hover_candidate_slot:
-            # сменился кандидат — перезапускаем таймер
+            # Сменился кандидат — перезапускаем таймер и убираем индикатор
             if self._hover_timer.isActive():
                 self._hover_timer.stop()
-            # остановим и уберём визуальный индикатор
-            try:
-                self._clear_hover_indicator()
-            except Exception:
-                pass
+            self._clear_hover_indicator()
 
             # Сбрасываем подсветку предыдущего кандидата
-            try:
-                if self._hover_candidate_slot is not None:
-                    self._hover_candidate_slot.set_highlight(False)
-            except Exception:
-                pass
+            if self._hover_candidate_slot is not None:
+                self._hover_candidate_slot.set_highlight(False)
 
             self._hover_candidate_slot = new_slot
             self._swap_done = False
-            # сброс готовности на новый кандидат
             self._hover_ready = False
 
             if new_slot is not None:
-                try:
-                    new_slot.set_highlight(True)
-                except Exception:
-                    pass
-                # если для элемента задана пользовательская задержка — используем её
-                try:
-                    scene = self.scene()
-                    delay = getattr(scene, 'swap_delay_ms', None)
-                    if delay is not None:
-                        self._hover_timer.setInterval(delay)
-                except Exception:
-                    pass
+                new_slot.set_highlight(True)
 
-                # Запускаем hover-timer и визуальный индикатор
+                # Если задана пользовательская задержка — используем её
+                delay = getattr(scene, 'swap_delay_ms', None)
+                if delay is not None:
+                    self._hover_timer.setInterval(int(delay))
+
                 self._hover_timer.start()
+                self._start_hover_indicator(scene, new_slot, cursor_pos)
 
-                try:
-                    # Настроим финальную метку времени
-                    delay = self._hover_timer.interval()
-                    self._hover_end_ts = int(time.time() * 1000) + int(delay)
+    def _start_hover_indicator(self, scene, slot, cursor_pos):
+        """Создаёт текстовый индикатор обратного отсчёта над слотом."""
+        delay = self._hover_timer.interval()
+        self._hover_end_ts = int(time.time() * 1000) + int(delay)
 
-                    # Создаём текстовый индикатор и добавим в сцену поверх всего
-                    scene = self.scene()
-                    if scene is not None:
-                        indicator = QGraphicsSimpleTextItem("")
-                        indicator.setZValue(10000)
-                        # Больший шрифт для лучшей видимости
-                        try:
-                            font = QFont()
-                            font.setPointSize(14)
-                            font.setBold(True)
-                            indicator.setFont(font)
-                            indicator.setBrush(QColor(255, 60, 60))
-                        except Exception:
-                            pass
+        indicator = QGraphicsSimpleTextItem("")
+        indicator.setZValue(10000)
+        font = QFont()
+        font.setPointSize(14)
+        font.setBold(True)
+        indicator.setFont(font)
+        indicator.setBrush(QColor(255, 60, 60))
 
-                        # позиционируем над слотом (по центру сверху)
-                        try:
-                            slot_center = new_slot.scenePos() + QPointF(new_slot.rect().width() / 2, 0)
-                            indicator.setPos(slot_center + QPointF(-20, -30))
-                        except Exception:
-                            indicator.setPos(cursor_pos + QPointF(-20, -30))
+        # Позиционируем над слотом (по центру сверху)
+        slot_center = slot.scenePos() + QPointF(slot.rect().width() / 2, 0)
+        indicator.setPos(slot_center + QPointF(-20, -30))
 
-                        scene.addItem(indicator)
-                        self._hover_indicator = indicator
+        scene.addItem(indicator)
+        self._hover_indicator = indicator
 
-                        # Создаём таймер обновления индикатора
-                        ct = QTimer()
-                        ct.setInterval(self._hover_indicator_interval)
+        ct = QTimer()
+        ct.setInterval(self._hover_indicator_interval)
 
-                        def _update_indicator():
-                            try:
-                                now = int(time.time() * 1000)
-                                remaining = max(0, int(self._hover_end_ts - now))
-                                if self._hover_indicator is not None:
-                                    self._hover_indicator.setText(f"{remaining} ms")
-                                if remaining <= 0:
-                                    try:
-                                        ct.stop()
-                                    except Exception:
-                                        pass
-                                    # при достижении нуля пометить готовность — но не выполнять перемещение
-                                    try:
-                                        # пометим, что на этом слоте можно поместить при отпускании
-                                        self._hover_ready = True
-                                        if self._hover_indicator is not None:
-                                            self._hover_indicator.setText("Release to drop")
-                                        ct.stop()
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
+        def _update_indicator():
+            if self._hover_end_ts is None:
+                ct.stop()
+                return
 
-                        ct.timeout.connect(_update_indicator)
-                        ct.start()
-                        self._hover_countdown_timer = ct
-                except Exception:
-                    pass
+            now = int(time.time() * 1000)
+            remaining = max(0, int(self._hover_end_ts - now))
+
+            if self._hover_indicator is not None:
+                if remaining > 0:
+                    self._hover_indicator.setText(
+                        f"{remaining} {i18n.t('ms')}"
+                    )
+                else:
+                    self._hover_indicator.setText(i18n.t('release_to_drop'))
+
+            if remaining <= 0:
+                # Пометим, что на этом слоте можно поместить при отпускании
+                self._hover_ready = True
+                ct.stop()
+
+        ct.timeout.connect(_update_indicator)
+        ct.start()
+        self._hover_countdown_timer = ct
 
     def mouseReleaseEvent(self, event):
+        if self._slot_panning:
+            from canvas.slot_item import TemplateSlotItem
+
+            self._slot_panning = False
+            self._slot_pan_last = None
+            old_offset = self._slot_pan_old_offset
+            self._slot_pan_old_offset = None
+
+            parent = self.parentItem()
+            if (
+                isinstance(parent, TemplateSlotItem)
+                and old_offset is not None
+                and old_offset != self.slot_offset
+            ):
+                from undo.commands import PanInSlotCommand
+
+                window = self._window()
+                if window is not None and hasattr(window, "undo_stack"):
+                    window.undo_stack.push(
+                        PanInSlotCommand(
+                            parent,
+                            self,
+                            old_offset,
+                            QPointF(self.slot_offset),
+                        )
+                    )
+            event.accept()
+            return
+
         self._panning = False
         self._last_mouse_pos = None
         super().mouseReleaseEvent(event)
 
-        if (
+        # Останавливаем таймер, если он активен (быстрый бросок)
+        if self._hover_timer.isActive():
+            self._hover_timer.stop()
+
+        scene = self.scene()
+        if scene is None:
+            return
+
+        handled = False
+        if getattr(scene, "is_template_mode", False):
+            handled = self._handle_template_release(event, scene)
+
+        # Обычная трансформация (перемещение/масштаб/поворот) — в undo-стек.
+        # Пропускаем, если размещением занималась слот-команда.
+        if not handled and (
             self._old_pos != self.pos()
             or self._old_scale != self.scale()
             or self._old_rotation != self.rotation()
         ):
             from undo.commands import TransformCommand
 
-            scene = self.scene()
-            if not scene or not scene.views():
-                return
-
-            view = scene.views()[0]
-            window = view.parent()
-
-            if hasattr(window, "undo_stack"):
+            window = self._window()
+            if window is not None and hasattr(window, "undo_stack"):
                 window.undo_stack.push(
                     TransformCommand(
                         self,
@@ -341,185 +472,127 @@ class ImageItem(QGraphicsPixmapItem):
                     )
                 )
 
-        # Если swap уже выполнен ранее — завершаем (сброс состояния)
-        if self._swap_done:
-            try:
-                self._clear_hover_indicator()
-            except Exception:
-                pass
+    def _handle_template_release(self, event, scene):
+        """Обработка отпускания мыши в шаблонном режиме.
+
+        Возвращает True, если событие обработано логикой слотов
+        (в этом случае TransformCommand не создаётся).
+        """
+        cursor_pos = event.scenePos()
+        new_slot = self._find_slot_at(scene, cursor_pos)
+        old_slot = self._old_parent_slot
+
+        # 1) Слот под курсором не найден — возвращаемся на место или в превью
+        if new_slot is None:
+            if old_slot is not None:
+                old_slot.accept_image(self)
+            else:
+                self._return_to_preview(scene)
+            self._finish_slot_interaction()
+            return True
+
+        # 2) Упали в тот же слот — возвращаем на прежнее место
+        #    (accept_image сохраняет slot_offset, поэтому случайный клик
+        #    больше не центрирует изображение)
+        if new_slot is old_slot:
+            new_slot.accept_image(self)
+            self._finish_slot_interaction()
+            return True
+
+        # ВАЖНО (fix): `other` инициализируется ДО всех веток — раньше при
+        # быстром броске в чужой слот возникал UnboundLocalError.
+        other = new_slot.image_item
+        if other is self:
+            other = None
+
+        # 3) Hover подтверждён — выполняем перемещение/обмен через undo-стек
+        if self._hover_ready:
+            self._push_slot_command(scene, new_slot, old_slot, other)
+            self._finish_slot_interaction()
+            return True
+
+        # 4) Пустой слот, перемещение между слотами без подтверждения — отмена
+        if other is None and old_slot is not None:
+            old_slot.accept_image(self)
+            self._finish_slot_interaction()
+            return True
+
+        # 5) Пустой слот, элемент не был в слоте — размещаем сразу (через undo-стек)
+        if other is None and old_slot is None:
+            self._push_slot_command(scene, new_slot, None, None)
+            self._finish_slot_interaction()
+            return True
+
+        # 6) Занятый слот без подтверждённого hover — отмена
+        if old_slot is not None:
+            old_slot.accept_image(self)
+        else:
+            self._return_to_preview(scene)
+        self._finish_slot_interaction()
+        return True
+
+    def _finish_slot_interaction(self):
+        """Сброс визуального состояния hover-взаимодействия."""
+        self._clear_hover_indicator()
+        if self._hover_candidate_slot is not None:
+            self._hover_candidate_slot.set_highlight(False)
             self._hover_candidate_slot = None
-            self._swap_done = False
-            return
+        self._hover_ready = False
+        self._swap_done = False
 
-        # Останавливаем таймер если он активен (быстрый бросок)
-        if self._hover_timer.isActive():
-            self._hover_timer.stop()
+    def _return_to_preview(self, scene):
+        """Вернуть изображение в панель превью и убрать его со сцены."""
+        window = self._window()
+        if window is not None and hasattr(window, "preview_panel"):
+            window.preview_panel.add_pixmap(
+                self.original_pixmap, self.source_path
+            )
+        else:
+            logger.warning(
+                "Preview panel is not available; image is removed from scene"
+            )
+        scene.removeItem(self)
 
-        # Обработка финального размещения: требуем подтверждённого swap для замены другого изображения
-        scene = self.scene()
-        if not scene:
-            return
+    def _push_slot_command(self, scene, new_slot, old_slot, other):
+        """Выполнить перемещение/обмен в слоте через undo-стек (пункт 4)."""
+        from undo.commands import MoveImageToSlotCommand
 
-        if getattr(scene, "is_template_mode", False):
-            # Определяем позицию курсора в координатах сцены и ищем слот под курсором
-            try:
-                cursor_pos = event.scenePos()
-            except Exception:
-                cursor_pos = self.mapToScene(self.boundingRect().center())
-            items = scene.items(cursor_pos)
-            new_slot = None
-            from canvas.slot_item import TemplateSlotItem
-            for it in items:
-                if isinstance(it, TemplateSlotItem):
-                    new_slot = it
-                    break
+        window = self._window()
+        command = MoveImageToSlotCommand(
+            scene, window, self, new_slot, old_slot, other
+        )
 
-            old_slot = getattr(self, "_old_parent_slot", None)
-
-            # Если нет нового слота — возвращаемся на место или в превью
-            if new_slot is None:
-                if old_slot is not None:
-                    old_slot.accept_image(self)
-                else:
-                    window = None
-                    if scene.views():
-                        view = scene.views()[0]
-                        window = view.parent()
-                    if window and hasattr(window, "preview_panel"):
-                        window.preview_panel.add_pixmap(self.original_pixmap)
-                    try:
-                        scene.removeItem(self)
-                    except Exception:
-                        pass
-                return
-
-            # Если упали в тот же слот — просто центрируем
-            if new_slot is old_slot:
-                new_slot.accept_image(self)
-                try:
-                    self._clear_hover_indicator()
-                except Exception:
-                    pass
-                return
-
-            # Если hover-timer подтвердил готовность — выполняем операцию при отпускании
-            if self._hover_ready:
-                try:
-                    other = new_slot.image_item
-                    if other is not None and other is not self:
-                        # поместить текущую в новый слот
-                        new_slot.accept_image(self)
-                        # вернуть другое изображение в старый слот или в превью
-                        if old_slot is not None:
-                            old_slot.accept_image(other)
-                        else:
-                            window = None
-                            if scene.views():
-                                view = scene.views()[0]
-                                window = view.parent()
-                            if window and hasattr(window, "preview_panel"):
-                                window.preview_panel.add_pixmap(other.original_pixmap)
-                                try:
-                                    scene.removeItem(other)
-                                except Exception:
-                                    pass
-                    else:
-                        # пустой слот — просто перемещаем
-                        new_slot.accept_image(self)
-                except Exception:
-                    pass
-
-                try:
-                    self._clear_hover_indicator()
-                except Exception:
-                    pass
-
-                # сбрасываем флаг готовности
-                self._hover_ready = False
-                # пометим, что swap сделан, чтобы остальная логика корректно завершилась
-                self._swap_done = True
-                return
-
-            # Если новый слот пустой — если старый слот был (перемещение между слотами), требуем подтверждённого hover
-            if other is None and old_slot is not None:
-                if self._swap_done:
-                    new_slot.accept_image(self)
-                    try:
-                        self._clear_hover_indicator()
-                    except Exception:
-                        pass
-                else:
-                    # быстрый бросок — отмена
-                    old_slot.accept_image(self)
-                return
-
-            # Если старого слота не было (перемещение из превью) — разрешаем поместить сразу
-            if other is None and old_slot is None:
-                new_slot.accept_image(self)
-                try:
-                    self._clear_hover_indicator()
-                except Exception:
-                    pass
-                return
-
-        return
-
-        # Safety fallback: если по какой-то причине элемент был удалён из сцены — восстановим в старый слот
-        try:
-            if scene and old_slot is not None:
-                if self not in scene.items():
-                    scene.addItem(self)
-                    old_slot.accept_image(self)
-        except Exception:
-            pass
+        if window is not None and hasattr(window, "undo_stack"):
+            # push() сразу вызывает redo() — операция выполняется здесь
+            window.undo_stack.push(command)
+        else:
+            logger.warning(
+                "Undo stack is not available; slot operation applied without undo"
+            )
+            command.redo()
 
     def _on_hover_timeout(self):
-        """Выполняется, если пользователь держит изображение над слотом достаточно долго."""
-        scene = self.scene()
-        if not scene:
+        """Таймер выдержки над слотом истёк — «взводим» слот.
+
+        ФИКС: раньше здесь сразу выполнялся swap (accept_image) при ещё
+        зажатой кнопке мыши. Стандартный drag-обработчик Qt продолжал
+        двигать элемент относительно точки нажатия ДО перепривязки к слоту,
+        поэтому любое микродвижение «отбрасывало» изображение далеко за
+        границы слота (и оно скрывалось обрезкой ItemClipsChildrenToShape).
+
+        Теперь таймер лишь помечает слот готовым (_hover_ready), а само
+        перемещение/обмен выполняется в mouseReleaseEvent при отпускании
+        кнопки (ветка `if self._hover_ready` в _handle_template_release).
+        Пользователь может передумать и продолжить перетаскивание в другой
+        слот — при смене кандидата флаг сбрасывается и таймер
+        перезапускается (см. mouseMoveEvent).
+        """
+        if self._hover_candidate_slot is None:
             return
 
-        slot = self._hover_candidate_slot
-        if slot is None:
-            return
+        self._hover_ready = True
 
-        old_slot = getattr(self, "_old_parent_slot", None)
-
-        # Если тот же слот — центрируем
-        if slot is old_slot:
-            slot.accept_image(self)
-            self._swap_done = True
-            return
-
-        other = slot.image_item
-        if other is not None and other is not self:
-            # Помещаем текущую в новый слот
-            slot.accept_image(self)
-
-            # Вернуть другое изображение в старый слот (если был)
-            if old_slot is not None:
-                old_slot.accept_image(other)
-            else:
-                if scene.views():
-                    view = scene.views()[0]
-                    window = view.parent()
-                else:
-                    window = None
-                if window and hasattr(window, "preview_panel"):
-                    window.preview_panel.add_pixmap(other.original_pixmap)
-                    try:
-                        scene.removeItem(other)
-                    except Exception:
-                        pass
-        else:
-            # Пустой слот — просто перемещаем
-            slot.accept_image(self)
-
-        # Очистим подсветку кандидата
-        try:
-            if self._hover_candidate_slot is not None:
-                self._hover_candidate_slot.set_highlight(False)
-        except Exception:
-            pass
-
-        self._swap_done = True
+        # Обновляем текст индикатора сразу, не дожидаясь тика
+        # countdown-таймера
+        if self._hover_indicator is not None:
+            self._hover_indicator.setText(i18n.t('release_to_drop'))

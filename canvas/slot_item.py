@@ -1,4 +1,8 @@
-from PySide6.QtWidgets import QGraphicsRectItem
+from PySide6.QtWidgets import (
+    QGraphicsRectItem,
+    QStyle,
+    QStyleOptionGraphicsItem,
+)
 from PySide6.QtGui import QPen, QBrush, QColor
 from PySide6.QtCore import Qt, QRectF, QPointF
 
@@ -15,7 +19,15 @@ class TemplateSlotItem(QGraphicsRectItem):
         self.index = index
         self.image_item = None  # сюда позже кладём ImageItem
 
+        # Базовый z-уровень слота (слои: выше/ниже других слотов).
+        # Подсветка при перетаскивании временно поднимает слот,
+        # поэтому настоящий слой храним отдельно и не теряем его.
+        self._base_z = 0.0
         self.setZValue(0)
+
+        # Слот можно выделить кликом (по пустой области или рамке),
+        # чтобы управлять его слоем через меню "Слои"
+        self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
 
         # визуально — только для отладки
         self.setPen(QPen(Qt.black, 1))
@@ -45,42 +57,86 @@ class TemplateSlotItem(QGraphicsRectItem):
             self.setPen(QPen(Qt.red, 2))
             # полупрозрачная заливка для визуального эффекта
             self.setBrush(QBrush(QColor(255, 0, 0, 50)))
-            self.setZValue(10)
+            # Поднимаем НАД всеми слотами, но с учётом базового слоя
+            self.setZValue(self._base_z + 10)
         else:
             self.setPen(QPen(Qt.black, 1))
             self.setBrush(QBrush(Qt.transparent))
-            self.setZValue(0)
+            self.setZValue(self._base_z)
 
         # показать/скрыть маркеры (учитываем режим скрытия визуализаций на сцене)
-        scene = self.scene()
-        suppress = False
-        try:
-            suppress = bool(getattr(scene, 'suppress_visuals', False))
-        except Exception:
-            suppress = False
+        suppress = bool(getattr(self.scene(), 'suppress_visuals', False))
 
         for h in self._handles.values():
             h.setVisible(on and not suppress)
 
-    def accept_image(self, image_item):
-        """Разместить `image_item` как дочерний элемент слота и центровать его."""
-        # Если в слоте уже есть изображение — удалим ссылку (фактический объект будет заменён извне)
-        if self.image_item is image_item:
-            return
+    # ---------- Слои (z-порядок слотов) ----------
 
-        # Если изображение раньше было привязано к другому слоту — очистим ту ссылку
-        try:
-            prev = image_item.parentItem()
-            if prev is not None and type(prev).__name__ == 'TemplateSlotItem' and prev is not self:
-                prev.image_item = None
-        except Exception:
-            pass
+    def base_z(self) -> float:
+        """Текущий слой слота (без учёта временной подсветки)."""
+        return self._base_z
+
+    def set_base_z(self, z: float):
+        """Установить слой слота (выше/ниже других слотов).
+
+        Изображение внутри слота — дочерний элемент, поэтому
+        оно поднимается/опускается вместе со слотом.
+        """
+        self._base_z = float(z)
+        # Если слот сейчас подсвечен — сохраняем приподнятое состояние
+        self.setZValue(self._base_z + 10 if self._highlighted else self._base_z)
+
+    def paint(self, painter, option, widget=None):
+        # При экспорте (suppress_visuals) скрываем стандартную
+        # пунктирную рамку выделения выбранного слота
+        suppress = bool(getattr(self.scene(), 'suppress_visuals', False))
+        if suppress and (option.state & QStyle.State_Selected):
+            option = QStyleOptionGraphicsItem(option)
+            option.state = option.state & ~QStyle.State_Selected
+        super().paint(painter, option, widget)
+
+    def accept_image(self, image_item):
+        """Разместить `image_item` как дочерний элемент слота.
+
+        Изображение масштабируется под слот (cover) и позиционируется
+        по центру с учётом пользовательского смещения `slot_offset`
+        (панорамирование внутри слота). Смещение сбрасывается только
+        когда изображение попадает в ДРУГОЙ слот (или приходит извне),
+        поэтому случайный клик/бросок в тот же слот больше не центрирует.
+        """
+        # Если изображение раньше было привязано к другому слоту — очистим ту ссылку.
+        # ВАЖНО (fix): очищаем ссылку только если она указывает именно на это
+        # изображение — иначе при обмене (swap) затиралась ссылка на уже
+        # помещённое в слот другое изображение.
+        prev = image_item.parentItem()
+        if (
+            isinstance(prev, TemplateSlotItem)
+            and prev is not self
+            and prev.image_item is image_item
+        ):
+            prev.image_item = None
+
+        # Смещение имеет смысл только внутри "своего" слота:
+        # при попадании в новый слот начинаем с центра.
+        if prev is not self:
+            image_item.slot_offset = QPointF(0, 0)
 
         self.image_item = image_item
         # Делегируем родительство — дочерний элемент будет обрезан по форме слота
         image_item.setParentItem(self)
 
-        # Подгоняем позицию и масштаб под слот
+        self.position_image(image_item)
+
+        # При изменении слота гарантируем, что маркеры обновлены
+        self._update_handles()
+
+    def position_image(self, image_item):
+        """Пересчитать масштаб и позицию изображения внутри слота.
+
+        Учитывает `image_item.slot_offset` — смещение относительно центра,
+        ограниченное так, чтобы слот всегда оставался полностью покрыт
+        изображением (без пустых полос по краям).
+        """
         slot_rect = self.rect()  # локальный rect с origin (0,0)
         pw = image_item.original_pixmap.width()
         ph = image_item.original_pixmap.height()
@@ -91,33 +147,37 @@ class TemplateSlotItem(QGraphicsRectItem):
         scale = max(sx, sy)
         image_item.setScale(scale)
 
-        # Центрируем изображение внутри слота (координаты относительны слоту)
         w_scaled = pw * scale
         h_scaled = ph * scale
 
         # Устанавливаем точку трансформации в левый верхний угол, чтобы масштабирование
         # и позиционирование были детерминированы относительно (0,0)
-        try:
-            image_item.setTransformOriginPoint(0, 0)
-        except Exception:
-            pass
+        image_item.setTransformOriginPoint(0, 0)
 
-        x = (slot_rect.width() - w_scaled) / 2
-        y = (slot_rect.height() - h_scaled) / 2
+        # Допустимое смещение: половина "излишка" картинки за пределами слота
+        max_dx = max(0.0, (w_scaled - slot_rect.width()) / 2)
+        max_dy = max(0.0, (h_scaled - slot_rect.height()) / 2)
+
+        offset = getattr(image_item, "slot_offset", QPointF(0, 0))
+        off_x = max(-max_dx, min(offset.x(), max_dx))
+        off_y = max(-max_dy, min(offset.y(), max_dy))
+
+        # Сохраняем уже ограниченное смещение
+        # (важно для undo и сохранения проекта)
+        image_item.slot_offset = QPointF(off_x, off_y)
+
+        x = (slot_rect.width() - w_scaled) / 2 + off_x
+        y = (slot_rect.height() - h_scaled) / 2 + off_y
         image_item.setPos(x, y)
-
-        # При изменении слота гарантируем, что маркеры обновлены
-        self._update_handles()
 
     def remove_image(self):
         if self.image_item:
-            # Отсоединяем связь, но не удаляем сам объект (удаление/перемещение обрабатывается снаружи)
+            # Отсоединяем связь, но не удаляем сам объект
+            # (удаление/перемещение обрабатывается снаружи)
             self.image_item = None
 
     def _create_handles(self):
         # Вспомогательный класс для маркера
-        from PySide6.QtWidgets import QGraphicsRectItem
-
         class _Handle(QGraphicsRectItem):
             def __init__(self, parent_slot, side):
                 super().__init__(0, 0, 24, 24, parent_slot)
@@ -147,14 +207,8 @@ class TemplateSlotItem(QGraphicsRectItem):
                 orig_bottom = orig_top + self._orig_rect.height()
 
                 scene = self.slot.scene()
-                canvas_w = None
-                canvas_h = None
-                try:
-                    canvas_w = getattr(scene, 'canvas_width', None)
-                    canvas_h = getattr(scene, 'canvas_height', None)
-                except Exception:
-                    canvas_w = None
-                    canvas_h = None
+                canvas_w = getattr(scene, 'canvas_width', None)
+                canvas_h = getattr(scene, 'canvas_height', None)
 
                 new_left = orig_left
                 new_top = orig_top
@@ -164,7 +218,7 @@ class TemplateSlotItem(QGraphicsRectItem):
                 if self.side == 'left':
                     dx = delta.x()
                     new_left = orig_left + dx
-                    # огранчение по min width
+                    # ограничение по min width
                     if new_right - new_left < self.slot._min_width:
                         new_left = new_right - self.slot._min_width
                 elif self.side == 'right':
@@ -210,18 +264,15 @@ class TemplateSlotItem(QGraphicsRectItem):
                 self.slot._update_handles()
 
                 # Если в слоте есть изображение — перестроить его
-                try:
-                    if self.slot.image_item is not None:
-                        self.slot.accept_image(self.slot.image_item)
-                except Exception:
-                    pass
+                if self.slot.image_item is not None:
+                    self.slot.accept_image(self.slot.image_item)
 
                 event.accept()
 
             def mouseReleaseEvent(self, event):
                 event.accept()
 
-        # Создаём 4-х маркеров
+        # Создаём 4 маркера
         sides = ['left', 'right', 'top', 'bottom']
         for s in sides:
             h = _Handle(self, s)
@@ -231,12 +282,7 @@ class TemplateSlotItem(QGraphicsRectItem):
 
     def hoverEnterEvent(self, event):
         # показываем маркеры при наведении (если не отключено на сцене)
-        scene = self.scene()
-        suppress = False
-        try:
-            suppress = bool(getattr(scene, 'suppress_visuals', False))
-        except Exception:
-            suppress = False
+        suppress = bool(getattr(self.scene(), 'suppress_visuals', False))
 
         for h in self._handles.values():
             h.setVisible(not suppress)
@@ -256,12 +302,7 @@ class TemplateSlotItem(QGraphicsRectItem):
         hh = self._handles.get('left').rect().height() if self._handles else 8
 
         # Учитываем режим скрытия визуалов на сцене
-        scene = self.scene()
-        suppress = False
-        try:
-            suppress = bool(getattr(scene, 'suppress_visuals', False))
-        except Exception:
-            suppress = False
+        suppress = bool(getattr(self.scene(), 'suppress_visuals', False))
 
         # left: по центру левой границы
         left = self._handles.get('left')
