@@ -552,8 +552,7 @@ class MainWindow(QMainWindow):
     # ---------- Helpers ----------
 
     def open_github(self):
-        """Открывает страницу GitHub в браузере."""
-        url = "https://github.com/re-quies/fastcollageforwin"  # Замените на ссылку вашего репозитория
+        url = "https://github.com/re-quies/fastcollageforwin"  
         if not url:
             logger.warning("GitHub URL is not configured; nothing to open")
             return
