@@ -1,6 +1,6 @@
 Fast Collage For Win is a small Python application for quickly creating collages.
 
-*Read this in other languages: [Russian](README.ru.md)
+*Read this in other languages: [Russian](README.ru.md) [Espanol](README.es.md)
 
 Two Working Modes
 
