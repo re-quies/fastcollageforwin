@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt%206-41CD52?logo=qt&logoColor=white" alt="PySide6, Qt 6">
   <img src="https://img.shields.io/badge/build-PyInstaller-FFD43B?logo=python&logoColor=black" alt="PyInstaller">
   <img src="https://img.shields.io/badge/i18n-EN%20%7C%20RU%20%7C%20ES%20%7C%20ZH%20%7C%20AR-2E86C1" alt="لغات الواجهة">
-  <img src="https://img.shields.io/badge/version-2.5.0-757575" alt="الإصدار 2.5.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-757575" alt="الإصدار 2.1.0">
 </p>
 
 <p align="center">
@@ -44,7 +44,7 @@
 - [بنية المستودع](#layout)
 - [الحدود](#limits)
 - [المشاركة في التطوير](#contributing)
-- [الترخيص](#license)
+- [الترخيص](LICENSE)
 
 <a id="about"></a>
 
@@ -128,15 +128,13 @@ PyInstaller في ملف تنفيذي واحد بلا نافذة طرفية.
 ## التركيب والتشغيل
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/re-quies/fastcollageforwin
 cd fastcollageforwin
 python -m venv .venv
 .venv\Scripts\activate
 pip install PySide6
 python main.py
 ```
-
-لا يقبل التطبيق أي وسائط في سطر الأوامر: كل شيء يجري من الواجهة.
 
 <a id="build"></a>
 
@@ -312,22 +310,3 @@ assets/icons/           أيقونات الواجهة
   تستخدم مخططًا مبسّطًا.
 - التصدير: 32000 بكسل للجانب على الأكثر، ونحو 2 غيغابايت للملف.
 - صيغ الإدخال: PNG وJPG وJPEG وBMP وWEBP.
-- لا توجد مجموعة اختبارات آلية في المستودع.
-
-<a id="contributing"></a>
-
-## المشاركة في التطوير
-
-- لا نص ثابت في كود الواجهة: كل عبارة تعيش في `i18n.py` ويجب أن
-  توجد باللغات الخمس جميعًا.
-- قبل إرسال أي تغيير: `python -m compileall .`.
-- سجل الإصدارات في [CHANGELOG.md](CHANGELOG.md).
-
-<a id="license"></a>
-
-## الترخيص
-
-لا يوجد ملف ترخيص بعد، وإلى أن يُضاف يحتفط المؤلف بكل الحقوق. وإن
-نشرت هذا المستودع فأضف ملف `LICENSE` وأشر إليه هنا.
-
-</div>
