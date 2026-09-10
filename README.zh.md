@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt%206-41CD52?logo=qt&logoColor=white" alt="PySide6, Qt 6">
   <img src="https://img.shields.io/badge/build-PyInstaller-FFD43B?logo=python&logoColor=black" alt="PyInstaller">
   <img src="https://img.shields.io/badge/i18n-EN%20%7C%20RU%20%7C%20ES%20%7C%20ZH%20%7C%20AR-2E86C1" alt="界面语言">
-  <img src="https://img.shields.io/badge/version-2.5.0-757575" alt="版本 2.5.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-757575" alt="版本 2.1.0">
 </p>
 
 <p align="center">
@@ -40,8 +40,7 @@
 - [项目、设置与日志](#projects)
 - [仓库结构](#layout)
 - [限制](#limits)
-- [参与开发](#contributing)
-- [许可协议](#license)
+- [许可协议](LICENSE)
 
 <a id="about"></a>
 
@@ -97,15 +96,13 @@ FastCollageForWin 把一堆照片合成一张图。把照片添加到左侧面�
 ## 安装与运行
 
 ```powershell
-git clone <仓库地址>
+git clone https://github.com/re-quies/fastcollageforwin
 cd fastcollageforwin
 python -m venv .venv
 .venv\Scripts\activate
 pip install PySide6
 python main.py
 ```
-
-仓库中还没有 `requirements.txt`——`pip install PySide6` 就是全部依赖。
 
 <a id="build"></a>
 
@@ -247,17 +244,6 @@ assets/icons/           界面图标
 - 画布适配在 20 张照片以内穷举完整的排版树，超过则改用简化方案。
 - 导出：单边最多 32000 px，单个文件约 2 GB。
 - 可导入的格式：PNG、JPG、JPEG、BMP、WEBP。
-- 仓库内没有自动化测试套件。
-
-<a id="contributing"></a>
-
-## 参与开发
-
-- 界面代码里不写死任何文本：每条字符串都放在 `i18n.py`，并且必须在五种语言中都存在。
-- 提交前请运行 `python -m compileall .`。
-- 版本历史见 [CHANGELOG.md](CHANGELOG.md)。
-
-<a id="license"></a>
 
 ## 许可协议
 
