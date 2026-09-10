@@ -273,3 +273,11 @@ ui/                main window, dialogs, image panel
 undo/              undo and redo commands
 assets/icons/      toolbar icons
 ```
+## Limits
+
+- Canvas side: 100-10000 px.
+- Grid generation in the start dialog: 1-100 photos.
+- Canvas fitting explores the full layout tree up to 20 photos; above that it
+  switches to a simplified search - still instant, but with fewer variants.
+- Export: side up to 32000 px, estimated file up to 2 GB.
+- Input formats: PNG, JPG, JPEG, BMP, WEBP.
