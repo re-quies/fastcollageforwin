@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt%206-41CD52?logo=qt&logoColor=white" alt="PySide6, Qt 6">
   <img src="https://img.shields.io/badge/build-PyInstaller-FFD43B?logo=python&logoColor=black" alt="PyInstaller">
   <img src="https://img.shields.io/badge/i18n-EN%20%7C%20RU%20%7C%20ES%20%7C%20ZH%20%7C%20AR-2E86C1" alt="Idiomas de la interfaz">
-  <img src="https://img.shields.io/badge/version-2.5.0-757575" alt="Versión 2.5.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-757575" alt="Versión 2.1.0">
 </p>
 
 <p align="center">
@@ -41,8 +41,7 @@
 - [Proyectos, ajustes y registro](#projects)
 - [Estructura del repositorio](#layout)
 - [Límites](#limits)
-- [Contribuir](#contributing)
-- [Licencia](#license)
+- [Licencia](LICENSE)
 
 <a id="about"></a>
 
@@ -129,16 +128,13 @@ Dos formas de trabajar:
 ## Instalación y uso
 
 ```powershell
-git clone <url-del-repositorio>
+git clone https://github.com/re-quies/fastcollageforwin
 cd fastcollageforwin
 python -m venv .venv
 .venv\Scripts\activate
 pip install PySide6
 python main.py
 ```
-
-Todavía no hay un `requirements.txt` en el repositorio: `pip install PySide6` es
-toda la lista de dependencias.
 
 <a id="build"></a>
 
@@ -318,20 +314,7 @@ assets/icons/           iconos de la interfaz
   encima de esa cifra usa un esquema simplificado.
 - Exportación: como máximo 32000 px por lado y unos 2 GB por archivo.
 - Formatos de entrada: PNG, JPG, JPEG, BMP, WEBP.
-- El repositorio no incluye una suíte de pruebas automatizadas.
 
-<a id="contributing"></a>
-
-## Contribuir
-
-- El código de la interfaz nunca lleva texto fijo: cada cadena vive en
-  `i18n.py` y debe existir en los cinco idiomas.
-- Antes de enviar cambios: `python -m compileall .`.
-- El historial de versiones está en [CHANGELOG.md](CHANGELOG.md).
-
-<a id="license"></a>
-
-## Licencia
 
 Todavía no hay archivo de licencia: hasta que se añada uno, el autor reserva
 todos los derechos. Si publicas este repositorio, añade un archivo `LICENSE` y
