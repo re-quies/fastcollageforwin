@@ -314,8 +314,3 @@ assets/icons/           iconos de la interfaz
   encima de esa cifra usa un esquema simplificado.
 - Exportación: como máximo 32000 px por lado y unos 2 GB por archivo.
 - Formatos de entrada: PNG, JPG, JPEG, BMP, WEBP.
-
-
-Todavía no hay archivo de licencia: hasta que se añada uno, el autor reserva
-todos los derechos. Si publicas este repositorio, añade un archivo `LICENSE` y
-menciónalo aquí.
