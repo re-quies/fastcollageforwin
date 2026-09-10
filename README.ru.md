@@ -42,7 +42,7 @@
 - [Структура репозитория](#layout)
 - [Ограничения](#limits)
 - [Разработка](#contributing)
-- [Лицензия](#license)
+- [Лицензия](LICENSE)
 
 <a id="about"></a>
 
@@ -316,11 +316,3 @@ assets/icons/           иконки интерфейса
   упрощённая схема.
 - Экспорт: не больше 32000 px по стороне и около 2 ГБ на файл.
 - Входные форматы: PNG, JPG, JPEG, BMP, WEBP.
-
-<a id="contributing"></a>
-
-<a id="license"></a>
-
-## Лицензия
-
-[LICENSE](LICENSE)
