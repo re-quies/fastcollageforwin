@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt%206-41CD52?logo=qt&logoColor=white" alt="GUI: PySide6, Qt 6">
   <img src="https://img.shields.io/badge/build-PyInstaller-FFD43B?logo=python&logoColor=black" alt="Build: PyInstaller">
   <img src="https://img.shields.io/badge/i18n-EN%20%7C%20RU%20%7C%20ES%20%7C%20ZH%20%7C%20AR-2E86C1" alt="Interface languages">
-  <img src="https://img.shields.io/badge/version-2.5.0-757575" alt="Version 2.5.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-757575" alt="Version 2.1.0">
 </p>
 
 <p align="center">
@@ -41,8 +41,7 @@
 - [Projects, settings and logs](#projects-settings-and-logs)
 - [Repository layout](#repository-layout)
 - [Limits](#limits)
-- [Contributing](#contributing)
-- [License](#license)
+- [License](LICENSE)
 
 ## What it does
 
@@ -122,9 +121,6 @@ python -m venv .venv
 pip install PySide6
 python main.py
 ```
-
-There is no `requirements.txt` in the repository yet - `pip install PySide6` is
-the entire dependency list.
 
 ## Build a standalone executable
 
@@ -277,27 +273,3 @@ ui/                main window, dialogs, image panel
 undo/              undo and redo commands
 assets/icons/      toolbar icons
 ```
-
-## Limits
-
-- Canvas side: 100-10000 px.
-- Grid generation in the start dialog: 1-100 photos.
-- Canvas fitting explores the full layout tree up to 20 photos; above that it
-  switches to a simplified search - still instant, but with fewer variants.
-- Export: side up to 32000 px, estimated file up to 2 GB.
-- Input formats: PNG, JPG, JPEG, BMP, WEBP.
-- There is no automated test suite in the repository yet.
-
-## Contributing
-
-- Keep `i18n.py` in sync: every key must exist in all five languages, otherwise
-  the interface silently falls back to English or Russian.
-- `python -m compileall .` is the cheapest smoke test. PySide6 dialogs need a
-  display, so most checks are still manual.
-- Release history and the technical details behind each change are in
-  [CHANGELOG.md](CHANGELOG.md).
-
-## License
-
-No license file yet - until one is added, all rights are reserved by the author.
-If you publish this repository, add a `LICENSE` file and name it here.
