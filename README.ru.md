@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt%206-41CD52?logo=qt&logoColor=white" alt="PySide6, Qt 6">
   <img src="https://img.shields.io/badge/build-PyInstaller-FFD43B?logo=python&logoColor=black" alt="PyInstaller">
   <img src="https://img.shields.io/badge/i18n-EN%20%7C%20RU%20%7C%20ES%20%7C%20ZH%20%7C%20AR-2E86C1" alt="Языки интерфейса">
-  <img src="https://img.shields.io/badge/version-2.5.0-757575" alt="Версия 2.5.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-757575" alt="Версия 2.1.0">
 </p>
 
 <p align="center">
@@ -128,7 +128,7 @@ FastCollageForWin собирает из кучи фотографий одну �
 ## Установка и запуск
 
 ```powershell
-git clone <адрес-репозитория>
+git clone https://github.com/re-quies/fastcollageforwin
 cd fastcollageforwin
 python -m venv .venv
 .venv\Scripts\activate
@@ -136,8 +136,6 @@ pip install PySide6
 python main.py
 ```
 
-Файла `requirements.txt` в репозитории пока нет — `pip install PySide6` и
-есть весь список зависимостей.
 
 <a id="build"></a>
 
@@ -318,7 +316,6 @@ assets/icons/           иконки интерфейса
   упрощённая схема.
 - Экспорт: не больше 32000 px по стороне и около 2 ГБ на файл.
 - Входные форматы: PNG, JPG, JPEG, BMP, WEBP.
-- Автоматических тестов в репозитории нет.
 
 <a id="contributing"></a>
 
@@ -333,6 +330,4 @@ assets/icons/           иконки интерфейса
 
 ## Лицензия
 
-Файла лицензии пока нет: до его появления все права принадлежат автору.
-Если вы публикуете этот репозиторий, добавьте файл `LICENSE` и укажите его
-здесь.
+[LICENSE](LICENSE)
