@@ -1,13 +1,31 @@
 import logging
+import math
 import time
 
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsSimpleTextItem
 from PySide6.QtGui import QPen, QPixmap, QFont, QColor, QPainter
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QTimer
 
+from core import image_cache
 import i18n
 
 logger = logging.getLogger(__name__)
+
+
+def _global_pos(event):
+    """Глобальная позиция курсора для события сцены (QPoint)."""
+    pos = event.screenPos()
+    return pos.toPoint() if hasattr(pos, "toPoint") else pos
+
+
+def _normalize_angle(angle) -> float:
+    """Угол в диапазоне (-180; 180] — чтобы не копить обороты."""
+    try:
+        angle = float(angle) % 360.0
+    except (TypeError, ValueError):
+        return 0.0
+
+    return angle - 360.0 if angle > 180.0 else angle
 
 
 class ImageItem(QGraphicsPixmapItem):
@@ -31,6 +49,9 @@ class ImageItem(QGraphicsPixmapItem):
         # ====== PAN STATE ======
         self._panning = False
         self._last_mouse_pos = None
+        # Кадрирование до начала сдвига мышью (режим Z):
+        # нужно, чтобы записать весь жест в undo одной командой
+        self._pan_view_start = None
 
         # ====== PAN INSIDE SLOT ======
         # Смещение относительно центра слота (панорамирование внутри слота).
@@ -40,6 +61,16 @@ class ImageItem(QGraphicsPixmapItem):
         self._slot_panning = False
         self._slot_pan_last = None
         self._slot_pan_old_offset = None
+
+        # ====== ROTATION INSIDE SLOT ======
+        # Поворот содержимого внутри слота, в градусах. Хранится
+        # отдельно от rotation() свободного элемента: в слоте картинка
+        # после поворота заново вписывается по cover
+        # (см. TemplateSlotItem.position_image), чтобы не появлялись пустые углы.
+        self.slot_rotation = 0.0
+        self._slot_rotating = False
+        self._slot_rotate_start_angle = 0.0
+        self._slot_rotate_old_angle = 0.0
 
         # ====== FLAGS ======
         self.setFlags(
@@ -64,7 +95,9 @@ class ImageItem(QGraphicsPixmapItem):
         # Hover-swap timer
         self._hover_timer = QTimer()
         self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(500)  # ms
+        # 0 мс = без задержки (умолчание приложения);
+        # реальное значение приходит из scene.swap_delay_ms
+        self._hover_timer.setInterval(0)  # ms
         self._hover_timer.timeout.connect(self._on_hover_timeout)
         self._hover_candidate_slot = None
         self._swap_done = False
@@ -74,6 +107,10 @@ class ImageItem(QGraphicsPixmapItem):
         self._hover_end_ts = None
         self._hover_indicator_interval = 100  # ms
         self._hover_ready = False
+
+        # Панель превью, над которой сейчас тащат изображение
+        # (обратный drag&drop: холст → превью)
+        self._preview_drop_target = None
 
     # ---------- Helpers ----------
 
@@ -92,6 +129,65 @@ class ImageItem(QGraphicsPixmapItem):
             if isinstance(it, TemplateSlotItem):
                 return it
         return None
+
+    def _preview_panel_at(self, global_pos):
+        """Панель превью, если курсор находится над ней.
+
+        Во время перетаскивания элемента мышь захвачена QGraphicsView,
+        поэтому сама панель событий не получает — попадание
+        определяем по глобальным координатам курсора.
+        """
+        window = self._window()
+        if window is None:
+            return None
+
+        panel = getattr(window, "preview_panel", None)
+        if panel is None or not panel.isVisible():
+            return None
+
+        rect = QRect(
+            panel.mapToGlobal(panel.rect().topLeft()),
+            panel.rect().size(),
+        )
+        return panel if rect.contains(global_pos) else None
+
+    def _set_preview_drop_target(self, panel):
+        """Подсветить панель превью как цель броска."""
+        if panel is self._preview_drop_target:
+            return
+
+        previous = self._preview_drop_target
+        if previous is not None and hasattr(previous, "set_drop_highlight"):
+            previous.set_drop_highlight(False)
+
+        self._preview_drop_target = panel
+
+        if panel is not None and hasattr(panel, "set_drop_highlight"):
+            panel.set_drop_highlight(True)
+
+    def _drop_into_preview(self, scene):
+        """Обратный drag&drop: изображение уходит с холста в панель.
+
+        Используется та же атомарная команда, что и для клавиши X,
+        поэтому Ctrl+Z возвращает фото на прежнее место (в слот
+        шаблона или в свободную позицию ДО начала перетаскивания).
+        """
+        from undo.commands import ReturnToPreviewCommand
+
+        window = self._window()
+        if window is not None and hasattr(window, "undo_stack"):
+            window.undo_stack.push(
+                ReturnToPreviewCommand(
+                    scene,
+                    window,
+                    self,
+                    self._old_pos,
+                    self._old_scale,
+                    self._old_rotation,
+                )
+            )
+        else:
+            self._return_to_preview(scene)
 
     def _clear_hover_indicator(self):
         if self._hover_countdown_timer is not None:
@@ -124,9 +220,18 @@ class ImageItem(QGraphicsPixmapItem):
         target = QRectF(
             0, 0, self.base_size.width(), self.base_size.height()
         )
-        source = self._visible_source_rect()
+        pixmap, source = self._paint_source()
 
         painter.save()
+
+        # Обрезка по внутренней области слота: отступы и скруглённые
+        # углы. Сам слот продолжает клиповать детей по своему
+        # прямоугольнику — тонкую форму задаём здесь, иначе
+        # маркеры-ползунки слота обрезались бы вместе с картинкой.
+        clip = self._slot_clip_path()
+        if clip is not None:
+            painter.setClipPath(clip)
+
         if self.mirrored_horizontal or self.mirrored_vertical:
             cx = target.width() / 2
             cy = target.height() / 2
@@ -136,7 +241,7 @@ class ImageItem(QGraphicsPixmapItem):
                 -1.0 if self.mirrored_vertical else 1.0,
             )
             painter.translate(-cx, -cy)
-        painter.drawPixmap(target, self.original_pixmap, source)
+        painter.drawPixmap(target, pixmap, source)
         painter.restore()
 
         # Рисуем рамку выделения только если сцена не просит скрыть визуалы
@@ -148,9 +253,56 @@ class ImageItem(QGraphicsPixmapItem):
             painter.setPen(pen)
             painter.drawRect(self.boundingRect())
 
+    def _slot_clip_path(self):
+        """Контур слота-родителя в координатах этого элемента.
+
+        Возвращает None для свободных изображений (вне слота) —
+        их ничего не обрезает.
+        """
+        from canvas.slot_item import TemplateSlotItem
+
+        parent = self.parentItem()
+        if not isinstance(parent, TemplateSlotItem):
+            return None
+
+        return self.mapFromParent(parent.content_path())
+
+    def _paint_source(self):
+        """Пиксмап и видимое окно в его координатах для отрисовки.
+
+        На холсте живёт уменьшенная «рабочая» копия (см. core.image_cache):
+        полноразмерные фото съедают сотни мегабайт, а экрану такое
+        разрешение не нужно. А вот на экспорте (suppress_visuals)
+        берём оригинал с диска и пересчитываем sourceRect в его
+        координаты — итоговый файл собирается из полного разрешения.
+        """
+        source = self._visible_source_rect()
+        working = self.original_pixmap
+
+        scene = self.scene()
+        if not bool(getattr(scene, "suppress_visuals", False)):
+            return working, source
+
+        if not self.source_path or working.isNull():
+            return working, source
+
+        full = image_cache.load_full_pixmap(self.source_path)
+        if full.isNull() or full.size() == working.size():
+            return working, source
+
+        kx = full.width() / working.width()
+        ky = full.height() / working.height()
+
+        return full, QRectF(
+            source.x() * kx,
+            source.y() * ky,
+            source.width() * kx,
+            source.height() * ky,
+        )
+
     def _visible_source_rect(self) -> QRectF:
         """Видимое окно оригинала с учётом зума и центра (в координатах
-        original_pixmap). Окно ограничено границами изображения."""
+        original_pixmap). Окно ограничено граница���� изображения."""
         w = self.original_pixmap.width() / self.zoom_factor
         h = self.original_pixmap.height() / self.zoom_factor
 
@@ -186,6 +338,21 @@ class ImageItem(QGraphicsPixmapItem):
         self._clamp_zoom_center()
         self.update()
 
+    def content_view_state(self):
+        """Текущее кадрирование содержимого: (зум, центр).
+
+        Используется undo-командами: жесты режима Z меняют
+        только эти два значения.
+        """
+        return float(self.zoom_factor), QPointF(self.zoom_center)
+
+    def apply_content_view(self, zoom, center):
+        """Восстановить кадрирование содержимого (undo/redo)."""
+        self.zoom_factor = max(1.0, min(float(zoom), 8.0))
+        self.zoom_center = QPointF(center)
+        self._clamp_zoom_center()
+        self.update()
+
     def mirror_image(self, axis: str):
         """Применяем зеркалирование изображения (без потери качества)"""
         if axis == 'horizontal':
@@ -195,6 +362,101 @@ class ImageItem(QGraphicsPixmapItem):
 
         self.update()
 
+    # ---------- Поворот внутри слота ----------
+
+    def _parent_slot(self):
+        """Родительский слот шаблона (или None для свободного элемента)."""
+        from canvas.slot_item import TemplateSlotItem
+
+        parent = self.parentItem()
+        return parent if isinstance(parent, TemplateSlotItem) else None
+
+    def _cursor_angle(self, scene_pos) -> float:
+        """Угол курсора относительно центра слота, в градусах."""
+        slot = self._parent_slot()
+        if slot is None:
+            return 0.0
+
+        center = slot.mapToScene(slot.content_rect().center())
+        delta = scene_pos - center
+
+        return math.degrees(math.atan2(delta.y(), delta.x()))
+
+    def _drag_rotate(self, event):
+        """Поворот перетаскиванием: картинка следует за курсором.
+
+        С зажатым Shift угол прилипает к шагу 15° — так проще выровнять
+        завалившийся горизонт или поставить ровные 90°.
+        """
+        slot = self._parent_slot()
+        if slot is None:
+            return
+
+        delta = self._cursor_angle(event.scenePos()) - self._slot_rotate_start_angle
+        new_angle = self._slot_rotate_old_angle + delta
+
+        if event.modifiers() & Qt.ShiftModifier:
+            new_angle = round(new_angle / 15.0) * 15.0
+
+        self.slot_rotation = _normalize_angle(new_angle)
+        slot.position_image(self)
+
+    def _finish_slot_rotation(self):
+        """Завершить жест поворота и записать его в историю одним шагом."""
+        self._slot_rotating = False
+        old_angle = self._slot_rotate_old_angle
+
+        slot = self._parent_slot()
+        if slot is None or abs(old_angle - self.slot_rotation) < 1e-6:
+            return
+
+        self._push_rotate_command(slot, old_angle, self.slot_rotation)
+
+    def _push_rotate_command(self, slot, old_angle, new_angle):
+        """Положить поворот в undo-стек (или применить напрямую)."""
+        from undo.commands import RotateInSlotCommand
+
+        command = RotateInSlotCommand(slot, self, old_angle, new_angle)
+
+        window = self._window()
+        if window is not None and hasattr(window, "undo_stack"):
+            window.undo_stack.push(command)
+        else:
+            logger.warning(
+                "Undo stack is not available; rotation applied without undo"
+            )
+            command.redo()
+
+    def rotate_in_slot(self, delta_degrees) -> bool:
+        """Довернуть содержимое внутри слота (через undo-стек).
+
+        Возвращает False, если изображение не в слоте: тогда вызывающая
+        сторона крутит сам элемент сцены.
+        """
+        slot = self._parent_slot()
+        if slot is None:
+            return False
+
+        old_angle = float(self.slot_rotation)
+        new_angle = _normalize_angle(old_angle + float(delta_degrees))
+
+        if abs(new_angle - old_angle) > 1e-6:
+            self._push_rotate_command(slot, old_angle, new_angle)
+
+        return True
+
+    def reset_slot_rotation(self) -> bool:
+        """Сбросить поворот содержимого в 0°."""
+        slot = self._parent_slot()
+        if slot is None:
+            return False
+
+        old_angle = float(self.slot_rotation)
+        if abs(old_angle) > 1e-6:
+            self._push_rotate_command(slot, old_angle, 0.0)
+
+        return True
+
     # ---------- Project serialization ----------
 
     def view_state(self) -> dict:
@@ -202,9 +464,16 @@ class ImageItem(QGraphicsPixmapItem):
         return {
             "zoom_factor": self.zoom_factor,
             "zoom_center": [self.zoom_center.x(), self.zoom_center.y()],
+            # Размер рабочей копии: zoom_center хранится в её координатах,
+            # а ограничение разрешения может отличаться между версиями
+            "base_size": [
+                self.original_pixmap.width(),
+                self.original_pixmap.height(),
+            ],
             "mirrored_horizontal": self.mirrored_horizontal,
             "mirrored_vertical": self.mirrored_vertical,
             "slot_offset": [self.slot_offset.x(), self.slot_offset.y()],
+            "slot_rotation": self.slot_rotation,
         }
 
     def apply_view_state(self, state: dict):
@@ -213,11 +482,29 @@ class ImageItem(QGraphicsPixmapItem):
 
         center = state.get("zoom_center")
         if isinstance(center, (list, tuple)) and len(center) == 2:
-            self.zoom_center = QPointF(float(center[0]), float(center[1]))
+            cx = float(center[0])
+            cy = float(center[1])
+
+            # Если рабочая копия загружена в другом разрешении, чем было
+            # при сохранении, центр зума пересчитываем пропорционально
+            base = state.get("base_size")
+            if (
+                isinstance(base, (list, tuple))
+                and len(base) == 2
+                and float(base[0]) > 0
+                and float(base[1]) > 0
+            ):
+                cx *= self.original_pixmap.width() / float(base[0])
+                cy *= self.original_pixmap.height() / float(base[1])
+
+            self.zoom_center = QPointF(cx, cy)
 
         offset = state.get("slot_offset")
         if isinstance(offset, (list, tuple)) and len(offset) == 2:
             self.slot_offset = QPointF(float(offset[0]), float(offset[1]))
+
+        # Проекты, сохранённые до появления поворота, откроются с 0°
+        self.slot_rotation = _normalize_angle(state.get("slot_rotation", 0.0))
 
         self.mirrored_horizontal = bool(state.get("mirrored_horizontal", False))
         self.mirrored_vertical = bool(state.get("mirrored_vertical", False))
@@ -247,6 +534,22 @@ class ImageItem(QGraphicsPixmapItem):
             if getattr(view, "content_zoom_mode", False):
                 self._panning = True
                 self._last_mouse_pos = event.pos()
+                # Состояние до жеста — для записи в undo при отпускании
+                self._pan_view_start = self.content_view_state()
+                event.accept()
+                return
+
+            # Поворот содержимого внутри слота: зажата R,
+            # картинка следует за курсором вокруг центра слота
+            if (
+                getattr(view, "slot_rotate_mode", False)
+                and self._old_parent_slot is not None
+            ):
+                self._slot_rotating = True
+                self._slot_rotate_old_angle = float(self.slot_rotation)
+                self._slot_rotate_start_angle = self._cursor_angle(
+                    event.scenePos()
+                )
                 event.accept()
                 return
 
@@ -266,6 +569,11 @@ class ImageItem(QGraphicsPixmapItem):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._slot_rotating:
+            self._drag_rotate(event)
+            event.accept()
+            return
+
         if self._slot_panning:
             from canvas.slot_item import TemplateSlotItem
 
@@ -287,15 +595,40 @@ class ImageItem(QGraphicsPixmapItem):
             delta = event.pos() - self._last_mouse_pos
             self._last_mouse_pos = event.pos()
 
+            # ФИКС: зеркалирование применяется на отрисовке
+            # (painter.scale(-1)), поэтому по отражённой оси экранное
+            # направление противоположно направлению в координатах
+            # пиксмапа. Без компенсации после отражения картинка
+            # ездила за мышью в обратную сторону.
+            dx = -delta.x() if self.mirrored_horizontal else delta.x()
+            dy = -delta.y() if self.mirrored_vertical else delta.y()
+
             # Панорамирование содержимого: только сдвиг центра +
             # перерисовка — без копирования пиксмапа на каждый mouse move
-            self.zoom_center -= delta / self.zoom_factor
+            self.zoom_center -= QPointF(dx, dy) / self.zoom_factor
             self._clamp_zoom_center()
             self.update()
             event.accept()
             return
 
         super().mouseMoveEvent(event)
+
+        # Обратный drag&drop: подсвечиваем панель превью, когда
+        # изображение тащат на неё
+        preview_panel = self._preview_panel_at(_global_pos(event))
+        self._set_preview_drop_target(preview_panel)
+
+        # Над панелью логика слотов не нужна: гасим обратный отсчёт,
+        # чтобы слот не остался "взведённым" на момент отпускания
+        if preview_panel is not None:
+            if self._hover_timer.isActive():
+                self._hover_timer.stop()
+            self._clear_hover_indicator()
+            if self._hover_candidate_slot is not None:
+                self._hover_candidate_slot.set_highlight(False)
+                self._hover_candidate_slot = None
+            self._hover_ready = False
+            return
 
         # При перемещении отслеживаем, над каким слотом находится курсор —
         # запускаем таймер для swap
@@ -352,8 +685,18 @@ class ImageItem(QGraphicsPixmapItem):
                 if delay is not None:
                     self._hover_timer.setInterval(int(delay))
 
-                self._hover_timer.start()
-                self._start_hover_indicator(scene, new_slot, cursor_pos)
+                if self._hover_timer.interval() <= 0:
+                    # Задержка выключена: слот готов сразу, без таймера
+                    # и без индикатора обратного отсчёта.
+                    #
+                    # Полагаться на QTimer с интервалом 0 нельзя: он
+                    # срабатывает только на следующем проходе цикла событий,
+                    # и быстрое перетаскивание успело бы завершиться раньше,
+                    # чем взведётся _hover_ready.
+                    self._hover_ready = True
+                else:
+                    self._hover_timer.start()
+                    self._start_hover_indicator(scene, new_slot, cursor_pos)
 
     def _start_hover_indicator(self, scene, slot, cursor_pos):
         """Создаёт текстовый индикатор обратного отсчёта над слотом."""
@@ -403,7 +746,45 @@ class ImageItem(QGraphicsPixmapItem):
         ct.start()
         self._hover_countdown_timer = ct
 
+    def _finish_content_pan(self):
+        """Записать сдвиг кадра (режим Z) в историю одним шагом.
+
+        ФИКС: раньше жест менял zoom_center напрямую — выбранное
+        кадрирование нельзя было отменить, и окно не считало
+        проект изменённым.
+        """
+        start = self._pan_view_start
+        self._pan_view_start = None
+
+        if start is None:
+            return
+
+        new_zoom, new_center = self.content_view_state()
+        if abs(start[0] - new_zoom) < 1e-6 and start[1] == new_center:
+            return
+
+        from undo.commands import ContentViewCommand
+
+        # Жест закончен, поэтому mergeable=False:
+        # следующий сдвиг — отдельный шаг Ctrl+Z
+        command = ContentViewCommand(
+            self, start[0], start[1], new_zoom, new_center, mergeable=False
+        )
+
+        window = self._window()
+        if window is not None and hasattr(window, "undo_stack"):
+            window.undo_stack.push(command)
+        else:
+            logger.warning(
+                "Undo stack is not available; framing applied without undo"
+            )
+
     def mouseReleaseEvent(self, event):
+        if self._slot_rotating:
+            self._finish_slot_rotation()
+            event.accept()
+            return
+
         if self._slot_panning:
             from canvas.slot_item import TemplateSlotItem
 
@@ -433,6 +814,9 @@ class ImageItem(QGraphicsPixmapItem):
             event.accept()
             return
 
+        if self._panning:
+            self._finish_content_pan()
+
         self._panning = False
         self._last_mouse_pos = None
         super().mouseReleaseEvent(event)
@@ -443,6 +827,17 @@ class ImageItem(QGraphicsPixmapItem):
 
         scene = self.scene()
         if scene is None:
+            self._set_preview_drop_target(None)
+            return
+
+        # ОБРАТНЫЙ DRAG&DROP: отпустили над панелью превью —
+        # изображение возвращается в панель (аналог клавиши X)
+        drop_panel = self._preview_panel_at(_global_pos(event))
+        self._set_preview_drop_target(None)
+
+        if drop_panel is not None:
+            self._finish_slot_interaction()
+            self._drop_into_preview(scene)
             return
 
         handled = False
@@ -554,7 +949,7 @@ class ImageItem(QGraphicsPixmapItem):
         scene.removeItem(self)
 
     def _push_slot_command(self, scene, new_slot, old_slot, other):
-        """Выполнить перемещение/обмен в слоте через undo-стек (пункт 4)."""
+        """Выполнить перемещение/обмен в слоте через undo-с��ек (пункт 4)."""
         from undo.commands import MoveImageToSlotCommand
 
         window = self._window()

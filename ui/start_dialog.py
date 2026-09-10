@@ -1,19 +1,17 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QRadioButton,
     QSpinBox, QDialogButtonBox, QLabel,
-    QComboBox, QHBoxLayout
+    QComboBox, QHBoxLayout, QToolButton
 )
 from core.collage_mode import CollageMode
+from core.canvas_presets import (
+    CANVAS_PRESETS,
+    DEFAULT_PRESET,
+    DEFAULT_PRESET_LABEL,
+    MAX_SIDE,
+    MIN_SIDE,
+)
 import i18n
-
-
-CANVAS_PRESETS = {
-    "1080×720": (1080, 720),
-    "1920×1080": (1920, 1080),
-    "2560×1440": (2560, 1440),
-    "3200×1800": (3200, 1800),
-    "3840×2160": (3840, 2160),
-}
 
 
 class StartCollageDialog(QDialog):
@@ -46,19 +44,27 @@ class StartCollageDialog(QDialog):
 
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(CANVAS_PRESETS.keys())
-        # Устанавливаем пресет по умолчанию 1920×1080
-        self.preset_combo.setCurrentText("1920×1080")
+        # Устанавливаем пресет по умолчанию 1920 × 1080
+        self.preset_combo.setCurrentText(DEFAULT_PRESET_LABEL)
         size_layout.addWidget(self.preset_combo)
 
         self.width_spin = QSpinBox()
-        self.width_spin.setRange(500, 10000)
-        self.width_spin.setValue(1920)
+        self.width_spin.setRange(MIN_SIDE, MAX_SIDE)
+        self.width_spin.setValue(DEFAULT_PRESET[0])
         size_layout.addWidget(self.width_spin)
 
         self.height_spin = QSpinBox()
-        self.height_spin.setRange(500, 10000)
-        self.height_spin.setValue(1080)
+        self.height_spin.setRange(MIN_SIDE, MAX_SIDE)
+        self.height_spin.setValue(DEFAULT_PRESET[1])
         size_layout.addWidget(self.height_spin)
+
+        # Кнопка смены ориентации: 1920×1080 -> 1080×1920
+        self.portrait = False
+        self.orientation_button = QToolButton()
+        self.orientation_button.setText("⇄")
+        self.orientation_button.setToolTip(i18n.t('swap_orientation'))
+        self.orientation_button.clicked.connect(self._toggle_orientation)
+        size_layout.addWidget(self.orientation_button)
 
         layout.addLayout(size_layout)
 
@@ -82,8 +88,28 @@ class StartCollageDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _toggle_orientation(self):
+        """Поменять местами ширину и высоту (альбомная / книжная).
+
+        Флаг self.portrait запоминает выбор, чтобы последующий выбор
+        пресета тоже применялся в нужной ориентации.
+        """
+        self.portrait = not self.portrait
+
+        width = self.width_spin.value()
+        height = self.height_spin.value()
+        self.width_spin.setValue(height)
+        self.height_spin.setValue(width)
+
     def _apply_preset(self, text):
-        w, h = CANVAS_PRESETS[text]
+        preset = CANVAS_PRESETS.get(text)
+        if preset is None:
+            return
+
+        w, h = preset
+        if self.portrait:
+            w, h = h, w
+
         self.width_spin.setValue(w)
         self.height_spin.setValue(h)
 

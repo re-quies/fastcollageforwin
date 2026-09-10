@@ -1,11 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
+# ФИКС: ресурсы (иконки) не попадали в сборку, потому что datas был пустым —
+# в собранном exe кнопка «новая сетка» оставалась без иконки.
+datas = [("assets", "assets")] if os.path.isdir("assets") else []
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
