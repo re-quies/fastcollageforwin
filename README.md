@@ -114,7 +114,7 @@ There are two ways to work:
 ## Install and run
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/re-quies/fastcollageforwin
 cd fastcollageforwin
 python -m venv .venv
 .venv\Scripts\activate
